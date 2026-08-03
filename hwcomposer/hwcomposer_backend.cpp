@@ -42,6 +42,7 @@
 #include <dlfcn.h>
 
 #include "hwcomposer_backend.h"
+#include "minisf_screen_capture.h"
 #ifdef HWC_DEVICE_API_VERSION_0_1
 #include "hwcomposer_backend_v0.h"
 #endif
@@ -55,6 +56,13 @@
 extern "C" void *android_dlopen(const char *filename, int flags);
 extern "C" void *android_dlsym(void *handle, const char *symbol);
 extern "C" int android_dlclose(void *handle);
+
+static MinisfScreenCaptureApi g_minisfScreenCaptureApi = {};
+
+const MinisfScreenCaptureApi *minisfScreenCaptureApi()
+{
+    return &g_minisfScreenCaptureApi;
+}
 
 HwComposerBackend::HwComposerBackend(hw_module_t *hwc_module, void *libmsf)
     : hwc_module(hwc_module), libminisf(libmsf)
@@ -93,6 +101,16 @@ initLegacyHwComposerQuirks()
 
     if (libminisf) {
         startMiniSurfaceFlinger = (void(*)(void))android_dlsym(libminisf, "startMiniSurfaceFlinger");
+        g_minisfScreenCaptureApi.init = (MinisfScreenCaptureApi::Init)
+            android_dlsym(libminisf, "minisf_screen_capture_init");
+        g_minisfScreenCaptureApi.producer = (MinisfScreenCaptureApi::Producer)
+            android_dlsym(libminisf, "minisf_screen_capture_producer");
+        g_minisfScreenCaptureApi.destroy = (MinisfScreenCaptureApi::Destroy)
+            android_dlsym(libminisf, "minisf_screen_capture_destroy");
+        g_minisfScreenCaptureApi.consumerNew = (MinisfScreenCaptureApi::ConsumerNew)
+            android_dlsym(libminisf, "minisf_screen_capture_consumer_new");
+        g_minisfScreenCaptureApi.getDimensions = (MinisfScreenCaptureApi::GetDimensions)
+            android_dlsym(libminisf, "minisf_screen_capture_get_dimensions");
     }
 
     if (startMiniSurfaceFlinger) {
@@ -114,7 +132,7 @@ HwComposerBackend::create()
         // Create hwcomposer backend directly without opening hardware module
         // because on some devices loading hwc2 module twice breaks graphics
         // (The first load is in the composer android service.)
-        return new HwComposerBackend_v20(NULL, NULL);
+        return new HwComposerBackend_v20(NULL, initLegacyHwComposerQuirks());
     }
 #endif
 
@@ -182,7 +200,7 @@ HwComposerBackend::create()
 #endif /* HWC_PLUGIN_HAVE_HWCOMPOSER1_API */
 #ifdef HWC_PLUGIN_HAVE_HWCOMPOSER2_API
             case HWC_DEVICE_API_VERSION_2_0:
-                return new HwComposerBackend_v20(NULL, NULL);
+                return new HwComposerBackend_v20(NULL, initLegacyHwComposerQuirks());
 #endif
             default:
                 fprintf(stderr, "Unknown hwcomposer API: 0x%x/0x%x/0x%x\n",
@@ -195,7 +213,7 @@ HwComposerBackend::create()
 #ifdef HWC_PLUGIN_HAVE_HWCOMPOSER2_API
     else {
         // Create hwc2 backend directly if opening hardware module fails
-        return new HwComposerBackend_v20(NULL, NULL);
+        return new HwComposerBackend_v20(NULL, initLegacyHwComposerQuirks());
     }
 #endif
 

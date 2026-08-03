@@ -55,11 +55,12 @@
 
 #include <inttypes.h>
 
-/* Screen capture (Phase 2) — droidmedia API + Android BufferQueue */
-#include <droidmedia/droidmedia.h>
+/* Screen capture (Phase 2) — opaque libminisf API + Android BufferQueue */
+#include "minisf_screen_capture.h"
 #include <gui/IGraphicBufferProducer.h>
 #include <gui/IGraphicBufferConsumer.h>
 #include <gui/BufferItem.h>
+#include <ui/Fence.h>
 
 /* EGL extensions needed for GPU blit — available via hybris libEGL */
 #include <EGL/egl.h>
@@ -136,7 +137,7 @@ class HWC2Window : public HWComposerNativeWindow
 
         /* ---------- Screen capture (Phase 2) ---------- */
         bool m_captureEnabled = false;
-        DroidMediaBufferQueue *m_captureQueue = nullptr;
+        void *m_captureQueue = nullptr;
         android::sp<android::IGraphicBufferProducer> m_captureProducer;
         int m_captureFrameSkip = 1;   /* 1 = every frame */
         int m_captureFrameCounter = 0;
@@ -146,12 +147,14 @@ class HWC2Window : public HWComposerNativeWindow
          * Avoids per-frame GL object creation which churns Qt's GL state. */
         std::map<buffer_handle_t, EGLImageKHR> m_captureEglImages;
         std::map<buffer_handle_t, GLuint> m_captureTextures;
+        GLuint m_captureFbo = 0;
+        GLuint m_captureProgram = 0;
 
         void captureInit(int width, int height);
         void captureShutdown();
         void captureFrame(HWComposerNativeWindowBuffer *src, int width, int height);
-        static void blitRgbaToRgba(GLuint srcTex, int sw, int sh,
-                                   GLuint dstTex, int dw, int dh);
+        void blitRgbaToRgba(GLuint srcTex, int sw, int sh,
+                            GLuint dstTex, int dw, int dh);
     protected:
         void present(HWComposerNativeWindowBuffer *buffer);
 
@@ -322,8 +325,15 @@ void HWC2Window::captureInit(int width, int height)
 
     qDebug("screencap: init %dx%d", width, height);
 
-    DroidMediaBufferQueue *q = nullptr;
-    droid_media_screen_capture_init(width, height, &q);
+    const MinisfScreenCaptureApi *api = minisfScreenCaptureApi();
+    if (!api->valid()) {
+        qWarning("screencap: libminisf screen-capture API unavailable");
+        m_captureEnabled = false;
+        return;
+    }
+
+    void *q = nullptr;
+    api->init(width, height, &q);
 
     if (!q) {
         qWarning("screencap: droid_media_screen_capture_init failed");
@@ -332,7 +342,16 @@ void HWC2Window::captureInit(int width, int height)
     }
 
     m_captureQueue = q;
-    m_captureProducer = q->producer();
+    m_captureProducer = static_cast<android::IGraphicBufferProducer *>(
+        api->producer(q));
+
+    if (m_captureProducer == nullptr) {
+        qWarning("screencap: producer lookup failed");
+        api->destroy(q);
+        m_captureQueue = nullptr;
+        m_captureEnabled = false;
+        return;
+    }
 
     qDebug("screencap: queue=%p producer=%p", q, m_captureProducer.get());
 }
@@ -354,9 +373,20 @@ void HWC2Window::captureShutdown()
         }
         m_captureEglImages.clear();
         m_captureTextures.clear();
+    if (m_captureFbo) {
+        glDeleteFramebuffers(1, &m_captureFbo);
+        m_captureFbo = 0;
+    }
+    if (m_captureProgram) {
+        glDeleteProgram(m_captureProgram);
+        m_captureProgram = 0;
+    }
 
         m_captureProducer.clear();
-        delete m_captureQueue;
+        const MinisfScreenCaptureApi *api = minisfScreenCaptureApi();
+        if (api->valid()) {
+            api->destroy(m_captureQueue);
+        }
         m_captureQueue = nullptr;
     }
 }
@@ -464,8 +494,12 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int 
         return;
     }
 
-    if (fence->isValid()) {
-        fence->waitForever(); /* slot fence, not GPU — brief */
+    if (fence != nullptr && fence->isValid()) {
+        if (fence->wait(1000) != android::NO_ERROR) {
+            qWarning("screencap: capture slot fence timed out; dropping frame");
+            m_captureProducer->cancelBuffer(slot, android::Fence::NO_FENCE);
+            return;
+        }
     }
 
     /* 3. EGLImage → GL texture for the capture buffer slot */
@@ -474,7 +508,10 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int 
     EGLImageKHR dstImg = ensureEglImage(dpy, capBuf->handle,
                                          m_captureEglImages, m_captureTextures,
                                          dstTex);
-    if (dstImg == EGL_NO_IMAGE_KHR) return;
+    if (dstImg == EGL_NO_IMAGE_KHR) {
+        m_captureProducer->cancelBuffer(slot, android::Fence::NO_FENCE);
+        return;
+    }
 
     /* Source: the screen buffer's native handle */
     buffer_handle_t srcHandle = src->handle;
@@ -482,7 +519,10 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int 
     EGLImageKHR srcImg = ensureEglImage(dpy, srcHandle,
                                          m_captureEglImages, m_captureTextures,
                                          srcTex);
-    if (srcImg == EGL_NO_IMAGE_KHR) return;
+    if (srcImg == EGL_NO_IMAGE_KHR) {
+        m_captureProducer->cancelBuffer(slot, android::Fence::NO_FENCE);
+        return;
+    }
 
     /* 4. GPU blit: plain RGBA→RGBA, no color conversion */
     blitRgbaToRgba(srcTex, width, height, dstTex, width, height);
@@ -509,15 +549,18 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int 
     err = m_captureProducer->queueBuffer(slot, qbi, &qbo);
     if (err != android::NO_ERROR) {
         qWarning("screencap: queueBuffer failed: %d", err);
+        m_captureProducer->cancelBuffer(slot, android::Fence::NO_FENCE);
     }
 }
 
 /* Simple RGBA→RGBA blit using a fullscreen quad and a trivial shader.
  * Both textures are already EGLImage-bound (GL_TEXTURE_2D from
  * GraphicBuffer backing). */
-void HWC2Window::blitRgbaToRgba(GLuint srcTex, int /*sw*/, int /*sh*/,
-                                GLuint dstTex, int /*dw*/, int /*dh*/)
+void HWC2Window::blitRgbaToRgba(GLuint srcTex, int sw, int sh,
+                                GLuint dstTex, int dw, int dh)
 {
+    (void)sw;
+    (void)sh;
     GlStateGuard guard;
 
     /* Trivial passthrough shader — just sample the source texture */
@@ -537,7 +580,7 @@ void HWC2Window::blitRgbaToRgba(GLuint srcTex, int /*sw*/, int /*sh*/,
         "}";
 
     /* Compile program once */
-    static GLuint program = 0;
+    GLuint &program = m_captureProgram;
     if (!program) {
         GLuint vs = glCreateShader(GL_VERTEX_SHADER);
         glShaderSource(vs, 1, &vsSrc, NULL);
@@ -554,7 +597,7 @@ void HWC2Window::blitRgbaToRgba(GLuint srcTex, int /*sw*/, int /*sh*/,
     }
 
     /* Create a temp FBO if we haven't already */
-    static GLuint fbo = 0;
+    GLuint &fbo = m_captureFbo;
     if (!fbo) glGenFramebuffers(1, &fbo);
 
     /* Fullscreen quad vertices */
@@ -574,7 +617,7 @@ void HWC2Window::blitRgbaToRgba(GLuint srcTex, int /*sw*/, int /*sh*/,
     glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 0, verts);
     glEnableVertexAttribArray(aPos);
 
-    glViewport(0, 0, 1, 1);  /* viewport is irrelevant; we're blitting tex→tex */
+    glViewport(0, 0, dw, dh);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
     glDisableVertexAttribArray(aPos);

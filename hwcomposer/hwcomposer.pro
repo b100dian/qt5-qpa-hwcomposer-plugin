@@ -18,6 +18,7 @@ HEADERS += hwcomposer_screeninfo.h
 
 SOURCES += hwcomposer_backend.cpp
 HEADERS += hwcomposer_backend.h
+HEADERS += minisf_screen_capture.h
 
 SOURCES += hwcomposer_backend_v0.cpp
 HEADERS += hwcomposer_backend_v0.h
