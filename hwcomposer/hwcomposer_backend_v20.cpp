@@ -55,18 +55,53 @@
 
 #include <inttypes.h>
 
-/* Screen capture (Phase 2) — opaque libminisf API + Android BufferQueue */
+/* Screen capture uses only the opaque libminisf C ABI. */
 #include "minisf_screen_capture.h"
-#include <gui/IGraphicBufferProducer.h>
-#include <gui/IGraphicBufferConsumer.h>
-#include <gui/BufferItem.h>
-#include <ui/Fence.h>
 
 /* EGL extensions needed for GPU blit — available via hybris libEGL */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+
+#ifndef EGL_RECORDABLE_ANDROID
+#define EGL_RECORDABLE_ANDROID 0x3142
+#endif
+
+/* The target SDK does not enable extension prototypes. Resolve these through
+ * EGL so the calls also pass through libhybris' EGLImage handle mapping. */
+typedef EGLImageKHR (*EglCreateImageKHR)(EGLDisplay, EGLContext, EGLenum,
+                                         EGLClientBuffer, const EGLint *);
+typedef EGLBoolean (*EglDestroyImageKHR)(EGLDisplay, EGLImageKHR);
+typedef void (*GlEglImageTargetTexture2DOES)(GLenum, GLeglImageOES);
+
+static EglCreateImageKHR eglCreateImageKhrProc()
+{
+    static EglCreateImageKHR proc = nullptr;
+    if (!proc) {
+        proc = (EglCreateImageKHR) eglGetProcAddress("eglCreateImageKHR");
+    }
+    return proc;
+}
+
+static EglDestroyImageKHR eglDestroyImageKhrProc()
+{
+    static EglDestroyImageKHR proc = nullptr;
+    if (!proc) {
+        proc = (EglDestroyImageKHR) eglGetProcAddress("eglDestroyImageKHR");
+    }
+    return proc;
+}
+
+static GlEglImageTargetTexture2DOES glEglImageTargetTexture2dOesProc()
+{
+    static GlEglImageTargetTexture2DOES proc = nullptr;
+    if (!proc) {
+        proc = (GlEglImageTargetTexture2DOES) eglGetProcAddress(
+            "glEGLImageTargetTexture2DOES");
+    }
+    return proc;
+}
 
 // #ifdef HWC_PLUGIN_HAVE_HWCOMPOSER1_API
 
@@ -135,26 +170,29 @@ class HWC2Window : public HWComposerNativeWindow
         std::vector<HWComposerNativeWindowBuffer*> m_slotCache;
         int m_nextSlot = 0;
 
-        /* ---------- Screen capture (Phase 2) ---------- */
+        /* ---------- Screen capture (Surface input) ---------- */
         bool m_captureEnabled = false;
-        void *m_captureQueue = nullptr;
-        android::sp<android::IGraphicBufferProducer> m_captureProducer;
+        void *m_captureTarget = nullptr;
+        void *m_captureNativeWindow = nullptr;
+        uint64_t m_captureGeneration = 0;
+        EGLSurface m_captureSurface = EGL_NO_SURFACE;
+        EGLContext m_captureContext = EGL_NO_CONTEXT;
         int m_captureFrameSkip = 1;   /* 1 = every frame */
         int m_captureFrameCounter = 0;
         int m_captureWidth = 0;
         int m_captureHeight = 0;
-        /* Per-slot EGLImage + GL texture cache, keyed by buffer_handle_t.
-         * Avoids per-frame GL object creation which churns Qt's GL state. */
+        /* Per-source-buffer EGLImage + GL texture cache. */
         std::map<buffer_handle_t, EGLImageKHR> m_captureEglImages;
         std::map<buffer_handle_t, GLuint> m_captureTextures;
-        GLuint m_captureFbo = 0;
         GLuint m_captureProgram = 0;
+        GLuint m_captureBarsProgram = 0;
+        bool m_captureTestBars = false;
 
         void captureInit(int width, int height);
         void captureShutdown();
         void captureFrame(HWComposerNativeWindowBuffer *src, int width, int height);
-        void blitRgbaToRgba(GLuint srcTex, int sw, int sh,
-                            GLuint dstTex, int dw, int dh);
+        void blitRgbaToSurface(GLuint srcTex, int dw, int dh);
+        void renderTestBars(int width, int height, int frame);
     protected:
         void present(HWComposerNativeWindowBuffer *buffer);
 
@@ -191,6 +229,9 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
     const char *capEnv = getenv("QPA_HWC_SCREENCAP");
     if (capEnv && (strcmp(capEnv, "1") == 0 || strcmp(capEnv, "true") == 0)) {
         m_captureEnabled = true;
+        const char *barsEnv = getenv("QPA_HWC_SCREENCAP_TEST_BARS");
+        m_captureTestBars = barsEnv &&
+            (strcmp(barsEnv, "1") == 0 || strcmp(barsEnv, "true") == 0);
         const char *skipEnv = getenv("QPA_HWC_SCREENCAP_FRAME_SKIP");
         if (skipEnv) m_captureFrameSkip = atoi(skipEnv);
         if (m_captureFrameSkip < 1) m_captureFrameSkip = 1;
@@ -250,13 +291,14 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
 
     QPA_HWC_TIMING_SAMPLE(prepareTime);
 
-    /* ---------- Screen capture (Phase 2) ----------
-     * Lazy-init the capture BufferQueue on first frame when EGL is live.
-     * Then: non-blocking dequeue → RGBA blit → fence → queue. */
-    if (m_captureEnabled && m_captureQueue == nullptr) {
+    /* ---------- Screen capture (Surface input) ----------
+     * The recorder owns the MediaCodec input Surface. QPA only imports the
+     * completed display buffer, blits it into the opaque EGL window surface,
+     * and lets eglSwapBuffers() queue it to the encoder. */
+    if (m_captureEnabled && m_captureTarget == nullptr) {
         captureInit(m_captureWidth, m_captureHeight);
     }
-    if (m_captureEnabled && m_captureProducer != nullptr) {
+    if (m_captureEnabled && m_captureTarget != nullptr) {
         captureFrame(buffer, m_captureWidth, m_captureHeight);
     }
 
@@ -314,86 +356,189 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
 }
 
 /* ================================================================ */
-/*  Screen capture methods (Phase 2)                                 */
+/*  Screen capture methods (MediaCodec Surface input)                */
 /* ================================================================ */
 
-/* lazy-init the capture BufferQueue.  Called on first frame after
- * EGL is live so we have a valid GL context for blitting. */
 void HWC2Window::captureInit(int width, int height)
 {
-    if (m_captureQueue != nullptr) return;
-
-    qDebug("screencap: init %dx%d", width, height);
+    if (m_captureTarget != nullptr) return;
 
     const MinisfScreenCaptureApi *api = minisfScreenCaptureApi();
     if (!api->valid()) {
-        qWarning("screencap: libminisf screen-capture API unavailable");
+        qWarning("screencap: libminisf Surface-input API unavailable");
         m_captureEnabled = false;
         return;
     }
 
-    void *q = nullptr;
-    api->init(width, height, &q);
-
-    if (!q) {
-        qWarning("screencap: droid_media_screen_capture_init failed");
-        m_captureEnabled = false;
+    uint64_t generation = 0;
+    void *target = api->targetAcquire(width, height, &generation);
+    if (!target) {
+        /* No recorder has registered an encoder input Surface yet. This is
+         * a normal idle state, not a display failure. Retry on a later frame. */
         return;
     }
 
-    m_captureQueue = q;
-    m_captureProducer = static_cast<android::IGraphicBufferProducer *>(
-        api->producer(q));
-
-    if (m_captureProducer == nullptr) {
-        qWarning("screencap: producer lookup failed");
-        api->destroy(q);
-        m_captureQueue = nullptr;
-        m_captureEnabled = false;
+    void *nativeWindow = api->targetNativeWindow(target);
+    if (!nativeWindow) {
+        qWarning("screencap: target returned no native window");
+        api->targetRelease(target);
         return;
     }
 
-    qDebug("screencap: queue=%p producer=%p", q, m_captureProducer.get());
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLConfig config = 0;
+    EGLint configAttrs[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RECORDABLE_ANDROID, EGL_TRUE,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLint numConfigs = 0;
+    if (!eglChooseConfig(dpy, configAttrs, &config, 1, &numConfigs) ||
+        numConfigs == 0) {
+        qWarning("screencap: no EGL window config for encoder Surface (0x%x)",
+                 eglGetError());
+        api->targetRelease(target);
+        return;
+    }
+
+    /* Match the standalone Surface-input test: create a dedicated GLES2
+     * context with the recordable config before creating the encoder window
+     * surface. Do not try to use the QSG context with a second window surface;
+     * some EGL implementations reject that combination. */
+    EGLSurface oldDraw = eglGetCurrentSurface(EGL_DRAW);
+    EGLSurface oldRead = eglGetCurrentSurface(EGL_READ);
+    EGLContext oldContext = eglGetCurrentContext();
+    if (!eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)) {
+        qWarning("screencap: cannot unbind QPA EGL surface (0x%x)",
+                 eglGetError());
+        api->targetRelease(target);
+        return;
+    }
+
+    EGLint contextAttrs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+    EGLContext captureContext = eglCreateContext(
+        dpy, config, EGL_NO_CONTEXT, contextAttrs);
+    if (captureContext == EGL_NO_CONTEXT) {
+        EGLint error = eglGetError();
+        eglMakeCurrent(dpy, oldDraw, oldRead, oldContext);
+        qWarning("screencap: eglCreateContext failed for encoder Surface (0x%x)",
+                 error);
+        api->targetRelease(target);
+        return;
+    }
+
+    EGLSurface surface = eglCreateWindowSurface(
+        dpy, config, (EGLNativeWindowType) nativeWindow, nullptr);
+    if (surface == EGL_NO_SURFACE) {
+        EGLint error = eglGetError();
+        eglDestroyContext(dpy, captureContext);
+        eglMakeCurrent(dpy, oldDraw, oldRead, oldContext);
+        qWarning("screencap: eglCreateWindowSurface failed for encoder Surface (0x%x)",
+                 error);
+        api->targetRelease(target);
+        return;
+    }
+
+    /* The encoder Surface has no display-vsync producer. Match the standalone
+     * Surface-input test and disable EGL swap throttling before the first
+     * capture frame, otherwise eglSwapBuffers() can wait forever. */
+    if (!eglMakeCurrent(dpy, surface, surface, captureContext) ||
+        !eglSwapInterval(dpy, 0)) {
+        EGLint error = eglGetError();
+        eglMakeCurrent(dpy, oldDraw, oldRead, oldContext);
+        eglDestroySurface(dpy, surface);
+        eglDestroyContext(dpy, captureContext);
+        qWarning("screencap: cannot configure encoder Surface (0x%x)", error);
+        api->targetRelease(target);
+        return;
+    }
+    if (!eglMakeCurrent(dpy, oldDraw, oldRead, oldContext)) {
+        EGLint error = eglGetError();
+        eglDestroySurface(dpy, surface);
+        eglDestroyContext(dpy, captureContext);
+        qWarning("screencap: failed to restore QPA EGL surfaces (0x%x)",
+                 error);
+        api->targetRelease(target);
+        return;
+    }
+
+    m_captureTarget = target;
+    m_captureNativeWindow = nativeWindow;
+    m_captureGeneration = generation;
+    m_captureSurface = surface;
+    m_captureContext = captureContext;
+    qDebug("screencap: encoder Surface target=%p generation=%" PRIu64,
+           target, generation);
 }
 
 void HWC2Window::captureShutdown()
 {
-    if (m_captureQueue) {
-        /* Destroy cached EGL images */
-        EGLDisplay dpy = eglGetCurrentDisplay();
-        if (dpy != EGL_NO_DISPLAY) {
-            for (auto &p : m_captureEglImages) {
-                if (p.second != EGL_NO_IMAGE_KHR)
-                    eglDestroyImageKHR(dpy, p.second);
-            }
-            for (auto &p : m_captureTextures) {
-                GLuint tex = p.second;
-                if (tex) glDeleteTextures(1, &tex);
-            }
-        }
-        m_captureEglImages.clear();
-        m_captureTextures.clear();
-    if (m_captureFbo) {
-        glDeleteFramebuffers(1, &m_captureFbo);
-        m_captureFbo = 0;
-    }
-    if (m_captureProgram) {
-        glDeleteProgram(m_captureProgram);
-        m_captureProgram = 0;
+    const MinisfScreenCaptureApi *api = minisfScreenCaptureApi();
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLSurface oldDraw = eglGetCurrentSurface(EGL_DRAW);
+    EGLSurface oldRead = eglGetCurrentSurface(EGL_READ);
+    EGLContext oldContext = eglGetCurrentContext();
+
+    if (dpy != EGL_NO_DISPLAY && m_captureContext != EGL_NO_CONTEXT &&
+        m_captureSurface != EGL_NO_SURFACE) {
+        eglMakeCurrent(dpy, m_captureSurface, m_captureSurface,
+                       m_captureContext);
     }
 
-        m_captureProducer.clear();
-        const MinisfScreenCaptureApi *api = minisfScreenCaptureApi();
-        if (api->valid()) {
-            api->destroy(m_captureQueue);
+    if (dpy != EGL_NO_DISPLAY) {
+        for (auto &p : m_captureEglImages) {
+            if (p.second != EGL_NO_IMAGE_KHR) {
+                EglDestroyImageKHR destroyImage = eglDestroyImageKhrProc();
+                if (destroyImage)
+                    destroyImage(dpy, p.second);
+            }
         }
-        m_captureQueue = nullptr;
+        for (auto &p : m_captureTextures) {
+            GLuint tex = p.second;
+            if (tex) glDeleteTextures(1, &tex);
+        }
+        if (m_captureProgram) {
+            glDeleteProgram(m_captureProgram);
+        }
+        if (m_captureBarsProgram) {
+            glDeleteProgram(m_captureBarsProgram);
+        }
     }
+    m_captureEglImages.clear();
+    m_captureTextures.clear();
+    m_captureProgram = 0;
+    m_captureBarsProgram = 0;
+
+    if (dpy != EGL_NO_DISPLAY && m_captureContext != EGL_NO_CONTEXT) {
+        eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (m_captureSurface != EGL_NO_SURFACE) {
+            eglDestroySurface(dpy, m_captureSurface);
+        }
+        eglDestroyContext(dpy, m_captureContext);
+    }
+    m_captureSurface = EGL_NO_SURFACE;
+    m_captureContext = EGL_NO_CONTEXT;
+    m_captureNativeWindow = nullptr;
+
+    if (dpy != EGL_NO_DISPLAY && oldContext != EGL_NO_CONTEXT) {
+        eglMakeCurrent(dpy, oldDraw, oldRead, oldContext);
+    }
+
+    if (m_captureTarget != nullptr && api->valid()) {
+        api->targetRelease(m_captureTarget);
+    }
+    m_captureTarget = nullptr;
+    m_captureGeneration = 0;
 }
 
-/* Cache an EGLImage + GL texture for a buffer_handle_t.
- * The HWC slot cache reuses a small set of buffers, so this map
- * stays at ~3 entries — no per-frame GL object churn. */
 static EGLImageKHR ensureEglImage(EGLDisplay dpy, buffer_handle_t h,
                                   std::map<buffer_handle_t, EGLImageKHR> &cache,
                                   std::map<buffer_handle_t, GLuint> &texCache,
@@ -405,15 +550,19 @@ static EGLImageKHR ensureEglImage(EGLDisplay dpy, buffer_handle_t h,
         return it->second;
     }
 
-    EGLint eglImgAttrs[] = {
-        EGL_IMAGE_PRESERVED_KHR, EGL_TRUE,
-        EGL_NONE
-    };
-    EGLImageKHR img = eglCreateImageKHR(dpy, EGL_NO_CONTEXT,
-                                         EGL_NATIVE_BUFFER_ANDROID,
-                                         (EGLClientBuffer)h, eglImgAttrs);
+    EglCreateImageKHR createImage = eglCreateImageKhrProc();
+    GlEglImageTargetTexture2DOES imageTarget =
+        glEglImageTargetTexture2dOesProc();
+    if (!createImage || !imageTarget) {
+        outTex = 0;
+        return EGL_NO_IMAGE_KHR;
+    }
+
+    EGLint eglImgAttrs[] = { EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE };
+    EGLImageKHR img = createImage(dpy, EGL_NO_CONTEXT,
+                                  EGL_NATIVE_BUFFER_ANDROID,
+                                  (EGLClientBuffer)h, eglImgAttrs);
     if (img == EGL_NO_IMAGE_KHR) {
-        qWarning("screencap: eglCreateImageKHR failed (0x%x)", eglGetError());
         outTex = 0;
         return EGL_NO_IMAGE_KHR;
     }
@@ -421,7 +570,7 @@ static EGLImageKHR ensureEglImage(EGLDisplay dpy, buffer_handle_t h,
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)img);
+    imageTarget(GL_TEXTURE_2D, (GLeglImageOES)img);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -433,8 +582,6 @@ static EGLImageKHR ensureEglImage(EGLDisplay dpy, buffer_handle_t h,
     return img;
 }
 
-/* Save/restore the active GL program/viewport/FBO around the blit.
- * This avoids polluting Qt's GL state. */
 struct GlStateGuard {
     GLint oldProgram, oldFbo, oldViewport[4];
     GLboolean scissor, blend, depthTest;
@@ -468,102 +615,121 @@ struct GlStateGuard {
     }
 };
 
-/* Capture a frame — called from HWC2Window::present() on the UI thread */
 void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int height)
 {
-    /* 1. Frame-rate decimation */
     if (++m_captureFrameCounter % m_captureFrameSkip != 0) return;
 
-    /* 2. Non-blocking dequeue — drop if none available */
-    int slot = -1;
-    android::sp<android::Fence> fence;
-    android::sp<android::GraphicBuffer> capBuf;
-    android::status_t err = m_captureProducer->dequeueBuffer(
-        &slot, &fence, width, height,
-        HAL_PIXEL_FORMAT_RGBA_8888,
-        GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_VIDEO_ENCODER,
-        /* frameIntervalNs */ 0, /* timestamp */ 0,
-        &capBuf);
-
-    if (err == -EAGAIN || err == -EBUSY) {
-        /* queue full — drop frame, do NOT block the UI thread */
-        return;
-    }
-    if (err != android::NO_ERROR) {
-        qWarning("screencap: dequeueBuffer failed: %d (0x%x)", err, -err);
+    const MinisfScreenCaptureApi *api = minisfScreenCaptureApi();
+    if (!api->valid() || !m_captureTarget ||
+        !api->targetIsCurrent(m_captureTarget, m_captureGeneration)) {
+        captureShutdown();
         return;
     }
 
-    if (fence != nullptr && fence->isValid()) {
-        if (fence->wait(1000) != android::NO_ERROR) {
-            qWarning("screencap: capture slot fence timed out; dropping frame");
-            m_captureProducer->cancelBuffer(slot, android::Fence::NO_FENCE);
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLSurface oldDraw = eglGetCurrentSurface(EGL_DRAW);
+    EGLSurface oldRead = eglGetCurrentSurface(EGL_READ);
+    EGLContext ctx = eglGetCurrentContext();
+
+    if (m_captureContext == EGL_NO_CONTEXT ||
+        !eglMakeCurrent(dpy, m_captureSurface, m_captureSurface,
+                        m_captureContext)) {
+        qWarning("screencap: cannot make encoder Surface current (0x%x)",
+                 eglGetError());
+        captureShutdown();
+        return;
+    }
+
+    if (m_captureTestBars) {
+        renderTestBars(width, height, m_captureFrameCounter);
+    } else {
+        GLuint srcTex = 0;
+        if (ensureEglImage(dpy, src->handle, m_captureEglImages,
+                          m_captureTextures, srcTex) == EGL_NO_IMAGE_KHR) {
+            eglMakeCurrent(dpy, oldDraw, oldRead, ctx);
+            qWarning("screencap: source EGLImage import failed (0x%x)",
+                     eglGetError());
             return;
         }
+
+        blitRgbaToSurface(srcTex, width, height);
+    }
+    glFlush();
+    EGLBoolean swapped = eglSwapBuffers(dpy, m_captureSurface);
+    EGLint swapError = swapped ? EGL_SUCCESS : eglGetError();
+
+    /* Always restore the QPA draw/read surfaces before releasing a failed
+     * encoder target. The capture surface must never remain current after
+     * captureShutdown() destroys it. */
+    if (!eglMakeCurrent(dpy, oldDraw, oldRead, ctx)) {
+        qWarning("screencap: failed to restore QPA EGL surfaces (0x%x)",
+                 eglGetError());
     }
 
-    /* 3. EGLImage → GL texture for the capture buffer slot */
-    EGLDisplay dpy = eglGetCurrentDisplay();
-    GLuint dstTex = 0;
-    EGLImageKHR dstImg = ensureEglImage(dpy, capBuf->handle,
-                                         m_captureEglImages, m_captureTextures,
-                                         dstTex);
-    if (dstImg == EGL_NO_IMAGE_KHR) {
-        m_captureProducer->cancelBuffer(slot, android::Fence::NO_FENCE);
-        return;
-    }
-
-    /* Source: the screen buffer's native handle */
-    buffer_handle_t srcHandle = src->handle;
-    GLuint srcTex = 0;
-    EGLImageKHR srcImg = ensureEglImage(dpy, srcHandle,
-                                         m_captureEglImages, m_captureTextures,
-                                         srcTex);
-    if (srcImg == EGL_NO_IMAGE_KHR) {
-        m_captureProducer->cancelBuffer(slot, android::Fence::NO_FENCE);
-        return;
-    }
-
-    /* 4. GPU blit: plain RGBA→RGBA, no color conversion */
-    blitRgbaToRgba(srcTex, width, height, dstTex, width, height);
-
-    /* 5. Fence the GPU blit. Do NOT eglClientWaitSync — pass the fd. */
-    EGLSyncKHR sync = eglCreateSyncKHR(dpy, EGL_SYNC_FENCE_KHR, NULL);
-    int fenceFd = -1;
-    if (sync != EGL_NO_SYNC_KHR) {
-        /* Flush, then dup the native fence fd */
-        glFlush();
-        fenceFd = eglDupNativeFenceFDANDROID(dpy, sync);
-        eglDestroySyncKHR(dpy, sync);
-    }
-
-    /* 6. Queue to the BufferQueue producer (in-process).
-     *    The consumer lives in the GStreamer process via Binder. */
-    android::IGraphicBufferProducer::QueueBufferOutput qbo;
-    android::IGraphicBufferProducer::QueueBufferInput qbi(
-        android::systemTime(), false,
-        android::HAL_DATASPACE_UNKNOWN,
-        android::Rect(width, height),
-        android::NATIVE_WINDOW_SCALING_MODE_FREEZE, 0,
-        fenceFd >= 0 ? new android::Fence(fenceFd) : android::Fence::NO_FENCE);
-    err = m_captureProducer->queueBuffer(slot, qbi, &qbo);
-    if (err != android::NO_ERROR) {
-        qWarning("screencap: queueBuffer failed: %d", err);
-        m_captureProducer->cancelBuffer(slot, android::Fence::NO_FENCE);
+    if (!swapped) {
+        qWarning("screencap: encoder eglSwapBuffers failed (0x%x)", swapError);
+        captureShutdown();
     }
 }
 
-/* Simple RGBA→RGBA blit using a fullscreen quad and a trivial shader.
- * Both textures are already EGLImage-bound (GL_TEXTURE_2D from
- * GraphicBuffer backing). */
-void HWC2Window::blitRgbaToRgba(GLuint srcTex, int sw, int sh,
-                                GLuint dstTex, int dw, int dh)
+void HWC2Window::renderTestBars(int dw, int dh, int frame)
 {
-    (void)sw;
-    (void)sh;
     GlStateGuard guard;
 
-    /* Trivial passthrough shader — just sample the source texture */
+    static const char *vsSrc =
+        "attribute vec2 aPos;\n"
+        "varying vec2 vPos;\n"
+        "void main() { gl_Position = vec4(aPos, 0.0, 1.0);"
+        " vPos = aPos * 0.5 + 0.5; }";
+    static const char *fsSrc =
+        "precision mediump float;\n"
+        "varying vec2 vPos; uniform float uFrame;\n"
+        "void main() { float x = vPos.x;"
+        " if (x > 0.90 && vPos.y < 0.10) {"
+        " float bit = mod(uFrame, 2.0);"
+        " gl_FragColor = bit < 1.0 ? vec4(0.0,0.0,0.0,1.0) :"
+        " vec4(1.0,1.0,1.0,1.0); }"
+        " else if (x < 0.143) gl_FragColor = vec4(1.0,1.0,1.0,1.0);"
+        " else if (x < 0.286) gl_FragColor = vec4(1.0,1.0,0.0,1.0);"
+        " else if (x < 0.429) gl_FragColor = vec4(0.0,1.0,1.0,1.0);"
+        " else if (x < 0.572) gl_FragColor = vec4(0.0,1.0,0.0,1.0);"
+        " else if (x < 0.715) gl_FragColor = vec4(1.0,0.0,1.0,1.0);"
+        " else if (x < 0.858) gl_FragColor = vec4(1.0,0.0,0.0,1.0);"
+        " else gl_FragColor = vec4(0.0,0.0,1.0,1.0); }";
+
+    if (!m_captureBarsProgram) {
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vs, 1, &vsSrc, NULL);
+        glCompileShader(vs);
+        GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fs, 1, &fsSrc, NULL);
+        glCompileShader(fs);
+        m_captureBarsProgram = glCreateProgram();
+        glAttachShader(m_captureBarsProgram, vs);
+        glAttachShader(m_captureBarsProgram, fs);
+        glBindAttribLocation(m_captureBarsProgram, 0, "aPos");
+        glLinkProgram(m_captureBarsProgram);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+    }
+
+    static const GLfloat verts[] = {
+        -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f
+    };
+    glUseProgram(m_captureBarsProgram);
+    glUniform1f(glGetUniformLocation(m_captureBarsProgram, "uFrame"),
+                static_cast<GLfloat>(frame));
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
+    glEnableVertexAttribArray(0);
+    glViewport(0, 0, dw, dh);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray(0);
+}
+
+void HWC2Window::blitRgbaToSurface(GLuint srcTex, int dw, int dh)
+{
+    GlStateGuard guard;
+
     static const char *vsSrc =
         "attribute vec2 aPos;\n"
         "varying vec2 vTex;\n"
@@ -579,7 +745,6 @@ void HWC2Window::blitRgbaToRgba(GLuint srcTex, int sw, int sh,
         "  gl_FragColor = texture2D(uTex, vTex);\n"
         "}";
 
-    /* Compile program once */
     GLuint &program = m_captureProgram;
     if (!program) {
         GLuint vs = glCreateShader(GL_VERTEX_SHADER);
@@ -596,32 +761,20 @@ void HWC2Window::blitRgbaToRgba(GLuint srcTex, int sw, int sh,
         glDeleteShader(fs);
     }
 
-    /* Create a temp FBO if we haven't already */
-    GLuint &fbo = m_captureFbo;
-    if (!fbo) glGenFramebuffers(1, &fbo);
-
-    /* Fullscreen quad vertices */
     static const GLfloat verts[] = {
-        -1.f, -1.f,  1.f, -1.f,  -1.f,  1.f,  1.f,  1.f };
-
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, dstTex, 0);
-
+        -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f
+    };
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glUseProgram(program);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, srcTex);
     glUniform1i(glGetUniformLocation(program, "uTex"), 0);
-
     GLint aPos = glGetAttribLocation(program, "aPos");
     glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 0, verts);
     glEnableVertexAttribArray(aPos);
-
     glViewport(0, 0, dw, dh);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
     glDisableVertexAttribArray(aPos);
-    glFlush();
 }
 
 int HwComposerBackend_v20::composerSequenceId = 0;

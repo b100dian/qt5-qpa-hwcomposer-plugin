@@ -7,23 +7,27 @@
 #ifndef QPA_MINISF_SCREEN_CAPTURE_H
 #define QPA_MINISF_SCREEN_CAPTURE_H
 
-#include <stddef.h>
+#include <stdint.h>
 
+/*
+ * The concrete Android Surface, BufferQueue producer, and all reference
+ * counting remain inside libminisf/libdroidmedia. QPA may only retain these
+ * handles and pass the native-window value to EGL.
+ */
 struct MinisfScreenCaptureApi {
-    typedef void (*Init)(int width, int height, void **outQueue);
-    typedef void *(*Producer)(void *queue);
-    typedef void (*Destroy)(void *queue);
-    typedef void *(*ConsumerNew)(void);
-    typedef int (*GetDimensions)(int *width, int *height);
+    typedef void *(*TargetAcquire)(int width, int height, uint64_t *generation);
+    typedef void *(*TargetNativeWindow)(void *target);
+    typedef void (*TargetRelease)(void *target);
+    typedef int (*TargetIsCurrent)(void *target, uint64_t generation);
 
-    Init init;
-    Producer producer;
-    Destroy destroy;
-    ConsumerNew consumerNew;
-    GetDimensions getDimensions;
+    TargetAcquire targetAcquire;
+    TargetNativeWindow targetNativeWindow;
+    TargetRelease targetRelease;
+    TargetIsCurrent targetIsCurrent;
 
     bool valid() const {
-        return init && producer && destroy && consumerNew && getDimensions;
+        return targetAcquire && targetNativeWindow && targetRelease &&
+               targetIsCurrent;
     }
 };
 

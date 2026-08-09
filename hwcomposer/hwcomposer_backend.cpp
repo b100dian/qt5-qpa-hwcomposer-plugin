@@ -101,16 +101,18 @@ initLegacyHwComposerQuirks()
 
     if (libminisf) {
         startMiniSurfaceFlinger = (void(*)(void))android_dlsym(libminisf, "startMiniSurfaceFlinger");
-        g_minisfScreenCaptureApi.init = (MinisfScreenCaptureApi::Init)
-            android_dlsym(libminisf, "minisf_screen_capture_init");
-        g_minisfScreenCaptureApi.producer = (MinisfScreenCaptureApi::Producer)
-            android_dlsym(libminisf, "minisf_screen_capture_producer");
-        g_minisfScreenCaptureApi.destroy = (MinisfScreenCaptureApi::Destroy)
-            android_dlsym(libminisf, "minisf_screen_capture_destroy");
-        g_minisfScreenCaptureApi.consumerNew = (MinisfScreenCaptureApi::ConsumerNew)
-            android_dlsym(libminisf, "minisf_screen_capture_consumer_new");
-        g_minisfScreenCaptureApi.getDimensions = (MinisfScreenCaptureApi::GetDimensions)
-            android_dlsym(libminisf, "minisf_screen_capture_get_dimensions");
+        g_minisfScreenCaptureApi.targetAcquire =
+            (MinisfScreenCaptureApi::TargetAcquire) android_dlsym(
+                libminisf, "minisf_screen_capture_target_acquire");
+        g_minisfScreenCaptureApi.targetNativeWindow =
+            (MinisfScreenCaptureApi::TargetNativeWindow) android_dlsym(
+                libminisf, "minisf_screen_capture_target_native_window");
+        g_minisfScreenCaptureApi.targetRelease =
+            (MinisfScreenCaptureApi::TargetRelease) android_dlsym(
+                libminisf, "minisf_screen_capture_target_release");
+        g_minisfScreenCaptureApi.targetIsCurrent =
+            (MinisfScreenCaptureApi::TargetIsCurrent) android_dlsym(
+                libminisf, "minisf_screen_capture_target_is_current");
     }
 
     if (startMiniSurfaceFlinger) {
