@@ -53,6 +53,7 @@
 
 #include "qsystrace_selector.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <time.h>
 
@@ -247,6 +248,8 @@ class HWC2Window : public HWComposerNativeWindow
         uint64_t m_captureObservedGeneration = 0;
         bool m_captureCandidateReady = false;
         bool m_captureCandidateLogged = false;
+        bool m_captureCandidateFenceValid = true;
+        int m_captureCandidateFenceFd = -1;
         HWComposerNativeWindowBuffer *m_captureCandidate = nullptr;
         /* Per-source-buffer EGLImage + GL texture cache. */
         std::map<buffer_handle_t, EGLImageKHR> m_captureEglImages;
@@ -254,14 +257,17 @@ class HWC2Window : public HWComposerNativeWindow
         GLuint m_captureProgram = 0;
         GLuint m_captureBarsProgram = 0;
         bool m_captureTestBars = false;
+        bool m_captureSource = false;
+        bool m_captureFlipY = false;
 
         void captureInit(const MinisfScreenCaptureSessionInfo &info);
         void captureShutdown();
         void captureFail(const char *reason);
         void captureAfterPrimarySwap();
-        void captureFrame(HWComposerNativeWindowBuffer *src, int width, int height);
-        void blitRgbaToSurface(GLuint srcTex, int dw, int dh);
-        void renderTestBars(int width, int height, int frame);
+        void captureFrame(HWComposerNativeWindowBuffer *src, int sourceFenceFd,
+                          bool sourceFenceValid, int width, int height);
+        bool blitRgbaToSurface(GLuint srcTex, int dw, int dh);
+        bool renderTestBars(int width, int height, int frame);
     protected:
         void present(HWComposerNativeWindowBuffer *buffer);
 
@@ -290,9 +296,8 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
     m_slotCache.resize(bufferCount, nullptr);
     m_syncBeforeSet = qEnvironmentVariableIsSet("QPA_HWC_SYNC_BEFORE_SET");
 
-    /* Capture remains limited to post-primary-swap test bars through Gate 2.3.
-     * Do not enable source EGLImage import until paced sessions are decodable
-     * and do not disturb lipstick. */
+    /* Capture mode is explicit so test bars remain available independently of
+     * the Gate 3 source EGLImage path. */
     m_captureWidth  = width;
     m_captureHeight = height;
     const char *capEnv = getenv("QPA_HWC_SCREENCAP");
@@ -300,10 +305,16 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
         const char *barsEnv = getenv("QPA_HWC_SCREENCAP_TEST_BARS");
         m_captureTestBars = barsEnv &&
             (strcmp(barsEnv, "1") == 0 || strcmp(barsEnv, "true") == 0);
-        if (!m_captureTestBars) {
-            qWarning("screencap: test-bars gates require QPA_HWC_SCREENCAP_TEST_BARS=1; capture disabled");
+        const char *sourceEnv = getenv("QPA_HWC_SCREENCAP_SOURCE");
+        m_captureSource = sourceEnv &&
+            (strcmp(sourceEnv, "1") == 0 || strcmp(sourceEnv, "true") == 0);
+        if (m_captureTestBars == m_captureSource) {
+            qWarning("screencap: select exactly one mode with "
+                     "QPA_HWC_SCREENCAP_TEST_BARS=1 or QPA_HWC_SCREENCAP_SOURCE=1; "
+                     "capture disabled");
             return;
         }
+        m_captureFlipY = qEnvironmentVariableIsSet("QPA_HWC_SCREENCAP_FLIP_Y");
 
         const char *fpsEnv = getenv("QPA_HWC_SCREENCAP_FPS");
         if (fpsEnv) {
@@ -319,14 +330,20 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
         if (m_captureFrameSkip < 1) m_captureFrameSkip = 1;
 
         m_captureEnabled = true;
-        qDebug("screencap: post-swap test bars enabled: fps=%s, limit=%d",
+        qDebug("screencap: post-swap %s enabled: fps=%s, limit=%d%s",
+               m_captureTestBars ? "test bars" : "HWC source",
                m_captureFpsOverride ? "environment override" : "recorder session",
-               m_captureFrameLimit);
+               m_captureFrameLimit,
+               m_captureSource && m_captureFlipY ? ", vertical flip" : "");
     }
 }
 
 HWC2Window::~HWC2Window()
 {
+    if (m_captureCandidateFenceFd >= 0) {
+        close(m_captureCandidateFenceFd);
+        m_captureCandidateFenceFd = -1;
+    }
     captureShutdown();  /* Phase 2 — release capture resources */
 
     if (m_lastBuffer != nullptr) {
@@ -401,6 +418,13 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
         m_nextSlot = (m_nextSlot + 1) % m_slotCache.size();
     }
 
+    int captureFenceFd = -1;
+    bool captureFenceValid = true;
+    if (m_captureEnabled && m_captureSource && acquireFenceFd >= 0) {
+        captureFenceFd = dup(acquireFenceFd);
+        captureFenceValid = captureFenceFd >= 0;
+    }
+
     hwc2_compat_display_set_client_target(hwcDisplay, slot, target,
                                           acquireFenceFd,
                                           HAL_DATASPACE_UNKNOWN);
@@ -436,12 +460,19 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
      * Record only the immediate candidate; EGL/Binder/capture work is done by
      * HwComposerBackend_v20::swap() after that outer swap returns. */
     if (m_captureEnabled) {
+        if (m_captureCandidateFenceFd >= 0) {
+            close(m_captureCandidateFenceFd);
+        }
         m_captureCandidate = buffer;
+        m_captureCandidateFenceFd = captureFenceFd;
+        m_captureCandidateFenceValid = captureFenceValid;
         m_captureCandidateReady = true;
         if (captureDebugEnabled() && !m_captureCandidateLogged) {
             m_captureCandidateLogged = true;
             qDebug("screencap: candidate recorded in present, awaiting primary swap return");
         }
+    } else if (captureFenceFd >= 0) {
+        close(captureFenceFd);
     }
 }
 
@@ -623,13 +654,6 @@ void HWC2Window::captureShutdown()
     }
 
     if (dpy != EGL_NO_DISPLAY && captureCurrent) {
-        for (auto &p : m_captureEglImages) {
-            if (p.second != EGL_NO_IMAGE_KHR) {
-                EglDestroyImageKHR destroyImage = eglDestroyImageKhrProc();
-                if (destroyImage)
-                    destroyImage(dpy, p.second);
-            }
-        }
         for (auto &p : m_captureTextures) {
             GLuint tex = p.second;
             if (tex) glDeleteTextures(1, &tex);
@@ -639,6 +663,16 @@ void HWC2Window::captureShutdown()
         }
         if (m_captureBarsProgram) {
             glDeleteProgram(m_captureBarsProgram);
+        }
+    }
+    if (dpy != EGL_NO_DISPLAY) {
+        EglDestroyImageKHR destroyImage = eglDestroyImageKhrProc();
+        if (destroyImage) {
+            for (auto &p : m_captureEglImages) {
+                if (p.second != EGL_NO_IMAGE_KHR) {
+                    destroyImage(dpy, p.second);
+                }
+            }
         }
     }
     m_captureEglImages.clear();
@@ -687,12 +721,22 @@ void HWC2Window::captureAfterPrimarySwapFromBackend()
     captureAfterPrimarySwap();
 }
 
+struct CaptureScopedFd {
+    explicit CaptureScopedFd(int value) : fd(value) {}
+    ~CaptureScopedFd() { if (fd >= 0) close(fd); }
+    int fd;
+};
+
 void HWC2Window::captureAfterPrimarySwap()
 {
     if (!m_captureCandidateReady) return;
     m_captureCandidateReady = false;
     HWComposerNativeWindowBuffer *candidate = m_captureCandidate;
+    const bool candidateFenceValid = m_captureCandidateFenceValid;
+    CaptureScopedFd candidateFence(m_captureCandidateFenceFd);
     m_captureCandidate = nullptr;
+    m_captureCandidateFenceFd = -1;
+    m_captureCandidateFenceValid = true;
 
     if (!m_captureEnabled || candidate == nullptr) return;
     if (m_captureFrameLimit > 0 &&
@@ -790,50 +834,161 @@ void HWC2Window::captureAfterPrimarySwap()
                " frame=%d generation=%" PRIu64,
                frameNowNs, m_captureFramesSubmitted + 1, m_captureGeneration);
     }
-    captureFrame(candidate, m_captureWidth, m_captureHeight);
+    captureFrame(candidate, candidateFence.fd, candidateFenceValid,
+                 m_captureWidth, m_captureHeight);
 }
 
-static EGLImageKHR ensureEglImage(EGLDisplay dpy, buffer_handle_t h,
+static bool captureHasExtension(const char *extensions, const char *name)
+{
+    if (!extensions || !name || strchr(name, ' ')) return false;
+    const size_t nameLength = strlen(name);
+    const char *match = extensions;
+    while ((match = strstr(match, name)) != nullptr) {
+        const bool startsToken = match == extensions || match[-1] == ' ';
+        const char next = match[nameLength];
+        if (startsToken && (next == '\0' || next == ' ')) return true;
+        match += nameLength;
+    }
+    return false;
+}
+
+static void clearCaptureGlErrors()
+{
+    while (glGetError() != GL_NO_ERROR) {}
+}
+
+static EGLImageKHR ensureEglImage(EGLDisplay dpy, buffer_handle_t key,
+                                  ANativeWindowBuffer *nativeBuffer,
                                   std::map<buffer_handle_t, EGLImageKHR> &cache,
                                   std::map<buffer_handle_t, GLuint> &texCache,
                                   GLuint &outTex)
 {
-    auto it = cache.find(h);
-    if (it != cache.end()) {
-        outTex = texCache[h];
-        return it->second;
+    auto imageIt = cache.find(key);
+    auto textureIt = texCache.find(key);
+    if (imageIt != cache.end() && textureIt != texCache.end()) {
+        outTex = textureIt->second;
+        return imageIt->second;
+    }
+
+    outTex = 0;
+    if (!key || !nativeBuffer) {
+        qWarning("screencap: source import rejected a null native buffer");
+        return EGL_NO_IMAGE_KHR;
     }
 
     EglCreateImageKHR createImage = eglCreateImageKhrProc();
+    EglDestroyImageKHR destroyImage = eglDestroyImageKhrProc();
     GlEglImageTargetTexture2DOES imageTarget =
         glEglImageTargetTexture2dOesProc();
-    if (!createImage || !imageTarget) {
-        outTex = 0;
+    if (!createImage || !destroyImage || !imageTarget) {
+        qWarning("screencap: source import extension entry point is unavailable "
+                 "(create=%d destroy=%d target=%d)",
+                 createImage != nullptr, destroyImage != nullptr,
+                 imageTarget != nullptr);
         return EGL_NO_IMAGE_KHR;
     }
 
     EGLint eglImgAttrs[] = { EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE };
     EGLImageKHR img = createImage(dpy, EGL_NO_CONTEXT,
                                   EGL_NATIVE_BUFFER_ANDROID,
-                                  (EGLClientBuffer)h, eglImgAttrs);
+                                  reinterpret_cast<EGLClientBuffer>(nativeBuffer),
+                                  eglImgAttrs);
     if (img == EGL_NO_IMAGE_KHR) {
-        outTex = 0;
+        const EGLint error = eglGetError();
+        qWarning("screencap: source eglCreateImageKHR(native buffer=%p) failed (0x%x)",
+                 static_cast<void *>(nativeBuffer), error);
         return EGL_NO_IMAGE_KHR;
     }
 
+    clearCaptureGlErrors();
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    imageTarget(GL_TEXTURE_2D, (GLeglImageOES)img);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    imageTarget(GL_TEXTURE_2D, reinterpret_cast<GLeglImageOES>(img));
+    GLenum error = glGetError();
+    if (error == GL_NO_ERROR) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        error = glGetError();
+    }
+    if (!tex || error != GL_NO_ERROR) {
+        qWarning("screencap: source texture binding failed (gl=0x%x)", error);
+        if (tex) glDeleteTextures(1, &tex);
+        destroyImage(dpy, img);
+        return EGL_NO_IMAGE_KHR;
+    }
 
-    cache[h] = img;
-    texCache[h] = tex;
+    cache[key] = img;
+    texCache[key] = tex;
     outTex = tex;
+    if (captureDebugEnabled()) {
+        qDebug("screencap: imported HWC source native buffer=%p texture=%u",
+               static_cast<void *>(nativeBuffer), tex);
+    }
     return img;
+}
+
+static GLuint compileCaptureShader(GLenum type, const char *source,
+                                   const char *label)
+{
+    GLuint shader = glCreateShader(type);
+    if (!shader) {
+        qWarning("screencap: %s shader creation failed (gl=0x%x)",
+                 label, glGetError());
+        return 0;
+    }
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    GLint compiled = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled == GL_TRUE) return shader;
+
+    char log[512] = {};
+    GLsizei length = 0;
+    glGetShaderInfoLog(shader, sizeof(log), &length, log);
+    qWarning("screencap: %s shader compilation failed: %.*s",
+             label, static_cast<int>(length), log);
+    glDeleteShader(shader);
+    return 0;
+}
+
+static GLuint createCaptureProgram(const char *vertexSource,
+                                   const char *fragmentSource,
+                                   const char *label)
+{
+    const GLuint vertex = compileCaptureShader(GL_VERTEX_SHADER, vertexSource,
+                                                label);
+    const GLuint fragment = compileCaptureShader(GL_FRAGMENT_SHADER,
+                                                  fragmentSource, label);
+    if (!vertex || !fragment) {
+        if (vertex) glDeleteShader(vertex);
+        if (fragment) glDeleteShader(fragment);
+        return 0;
+    }
+
+    const GLuint program = glCreateProgram();
+    if (program) {
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glBindAttribLocation(program, 0, "aPos");
+        glLinkProgram(program);
+    }
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+
+    GLint linked = GL_FALSE;
+    if (program) glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (linked == GL_TRUE) return program;
+
+    char log[512] = {};
+    GLsizei length = 0;
+    if (program) glGetProgramInfoLog(program, sizeof(log), &length, log);
+    qWarning("screencap: %s program link failed: %.*s",
+             label, static_cast<int>(length), log);
+    if (program) glDeleteProgram(program);
+    return 0;
 }
 
 struct GlStateGuard {
@@ -869,14 +1024,38 @@ struct GlStateGuard {
     }
 };
 
-void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int height)
+void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src,
+                              int sourceFenceFd, bool sourceFenceValid,
+                              int width, int height)
 {
-    Q_UNUSED(src);
-
     const MinisfScreenCaptureApi *api = minisfScreenCaptureApi();
     if (!api->valid() || !m_captureTarget) {
         captureFail("encoder target is unavailable");
         return;
+    }
+
+    if (m_captureSource) {
+        if (!sourceFenceValid) {
+            qWarning("screencap: source acquire-fence duplication failed in present");
+            captureFail("source acquire-fence duplication failed");
+            return;
+        }
+        if (sourceFenceFd >= 0) {
+            const int64_t waitStartNs = captureMonotonicNs();
+            const int waitResult = sync_wait(sourceFenceFd, 250);
+            const int waitError = waitResult == 0 ? 0 : errno;
+            const int64_t waitDurationNs = captureMonotonicNs() - waitStartNs;
+            if (captureDebugEnabled()) {
+                qDebug("screencap: source acquire-fence wait took %.3fms result=%d",
+                       waitDurationNs / 1000000.0, waitResult);
+            }
+            if (waitResult != 0) {
+                qWarning("screencap: source acquire-fence wait failed after %.3fms (errno=%d)",
+                         waitDurationNs / 1000000.0, waitError);
+                captureFail("source acquire-fence wait failed");
+                return;
+            }
+        }
     }
 
     EglPresentationTimeANDROID presentationTime = eglPresentationTimeAndroidProc();
@@ -900,17 +1079,83 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int 
         return;
     }
 
-    /* Gate 2.3 intentionally proves paced post-swap test bars. Source EGLImage
-     * import remains forbidden until the paced session lifecycle passes. */
-    if (!m_captureTestBars) {
-        qWarning("screencap: real source capture is not enabled before Gate 3");
-        eglMakeCurrent(dpy, oldDraw, oldRead, ctx);
-        captureFail("non-test-bars rendering requested before Gate 3");
-        return;
+    const char *renderFailure = nullptr;
+    if (m_captureTestBars) {
+        if (!renderTestBars(width, height, m_captureFramesSubmitted)) {
+            renderFailure = "test-bars shader/draw failed";
+        }
+    } else {
+        const char *eglExtensions = eglQueryString(dpy, EGL_EXTENSIONS);
+        const EGLint eglExtensionError = eglExtensions
+            ? EGL_SUCCESS : eglGetError();
+        const char *glExtensions = reinterpret_cast<const char *>(
+            glGetString(GL_EXTENSIONS));
+        const GLenum glExtensionError = glExtensions
+            ? GL_NO_ERROR : glGetError();
+        const bool hasImageBase =
+            captureHasExtension(eglExtensions, "EGL_KHR_image") ||
+            captureHasExtension(eglExtensions, "EGL_KHR_image_base");
+        if (!hasImageBase ||
+            !captureHasExtension(eglExtensions,
+                                 "EGL_ANDROID_image_native_buffer") ||
+            !captureHasExtension(glExtensions, "GL_OES_EGL_image")) {
+            qWarning("screencap: source EGLImage extensions unavailable "
+                     "(KHR_image=%d ANDROID_native_buffer=%d OES_EGL_image=%d "
+                     "egl=0x%x gl=0x%x)", hasImageBase,
+                     captureHasExtension(eglExtensions,
+                                         "EGL_ANDROID_image_native_buffer"),
+                     captureHasExtension(glExtensions, "GL_OES_EGL_image"),
+                     eglExtensionError, glExtensionError);
+            renderFailure = "source EGLImage extension check failed";
+        } else if (!src) {
+            qWarning("screencap: source buffer is null");
+            renderFailure = "source buffer is null";
+        } else {
+            GLuint sourceTexture = 0;
+            EGLImageKHR sourceImage = ensureEglImage(
+                dpy, src->handle, src->getNativeBuffer(),
+                m_captureEglImages, m_captureTextures, sourceTexture);
+            if (sourceImage == EGL_NO_IMAGE_KHR || !sourceTexture) {
+                renderFailure = "source EGLImage import failed";
+            } else if (!blitRgbaToSurface(sourceTexture, width, height)) {
+                renderFailure = "source texture blit failed";
+            }
+        }
     }
 
-    renderTestBars(width, height, m_captureFramesSubmitted);
-    glFlush();
+    if (!renderFailure) {
+        glFlush();
+        const GLenum flushError = glGetError();
+        if (flushError != GL_NO_ERROR) {
+            qWarning("screencap: capture render flush failed (gl=0x%x)",
+                     flushError);
+            renderFailure = m_captureTestBars
+                ? "test-bars flush failed" : "source blit flush failed";
+        }
+    }
+
+    if (renderFailure) {
+        if (!eglMakeCurrent(dpy, oldDraw, oldRead, ctx)) {
+            const EGLint restoreError = eglGetError();
+            eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            const EGLBoolean restored = eglMakeCurrent(dpy, oldDraw, oldRead, ctx);
+            const EGLint retryError = restored ? EGL_SUCCESS : eglGetError();
+            qWarning("screencap: failed to restore QPA EGL surfaces after render failure "
+                     "(0x%x, retry=0x%x)", restoreError, retryError);
+            if (!restored) {
+                captureFail("QPA EGL restore after render failure failed");
+                if (!eglMakeCurrent(dpy, oldDraw, oldRead, ctx)) {
+                    qWarning("screencap: QPA EGL restore still failed after teardown (0x%x)",
+                             eglGetError());
+                }
+                return;
+            }
+            captureFail("QPA EGL restore after render failure required a retry");
+            return;
+        }
+        captureFail(renderFailure);
+        return;
+    }
 
     const int64_t timestampNs = captureMonotonicNs();
     EGLBoolean timestamped = presentationTime(
@@ -958,8 +1203,9 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int 
     }
 
     ++m_captureFramesSubmitted;
-    qDebug("screencap: submitted test-bars frame %d pts=%" PRId64
-           " swap=%.3fms", m_captureFramesSubmitted, timestampNs,
+    qDebug("screencap: submitted %s frame %d pts=%" PRId64
+           " swap=%.3fms", m_captureTestBars ? "test-bars" : "HWC-source",
+           m_captureFramesSubmitted, timestampNs,
            swapDurationNs / 1000000.0);
 
     if (swapDurationNs > 16666667LL) {
@@ -979,7 +1225,7 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int 
     }
 }
 
-void HWC2Window::renderTestBars(int dw, int dh, int frame)
+bool HWC2Window::renderTestBars(int dw, int dh, int frame)
 {
     GlStateGuard guard;
 
@@ -1005,21 +1251,11 @@ void HWC2Window::renderTestBars(int dw, int dh, int frame)
         " else gl_FragColor = vec4(0.0,0.0,1.0,1.0); }";
 
     if (!m_captureBarsProgram) {
-        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
-        glShaderSource(vs, 1, &vsSrc, NULL);
-        glCompileShader(vs);
-        GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fs, 1, &fsSrc, NULL);
-        glCompileShader(fs);
-        m_captureBarsProgram = glCreateProgram();
-        glAttachShader(m_captureBarsProgram, vs);
-        glAttachShader(m_captureBarsProgram, fs);
-        glBindAttribLocation(m_captureBarsProgram, 0, "aPos");
-        glLinkProgram(m_captureBarsProgram);
-        glDeleteShader(vs);
-        glDeleteShader(fs);
+        m_captureBarsProgram = createCaptureProgram(vsSrc, fsSrc, "test-bars");
+        if (!m_captureBarsProgram) return false;
     }
 
+    clearCaptureGlErrors();
     static const GLfloat verts[] = {
         -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f
     };
@@ -1031,18 +1267,26 @@ void HWC2Window::renderTestBars(int dw, int dh, int frame)
     glViewport(0, 0, dw, dh);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray(0);
+    const GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        qWarning("screencap: test-bars draw failed (gl=0x%x)", error);
+        return false;
+    }
+    return true;
 }
 
-void HWC2Window::blitRgbaToSurface(GLuint srcTex, int dw, int dh)
+bool HWC2Window::blitRgbaToSurface(GLuint srcTex, int dw, int dh)
 {
     GlStateGuard guard;
 
     static const char *vsSrc =
         "attribute vec2 aPos;\n"
         "varying vec2 vTex;\n"
+        "uniform float uFlipY;\n"
         "void main() {\n"
         "  gl_Position = vec4(aPos, 0.0, 1.0);\n"
-        "  vTex = aPos * 0.5 + 0.5;\n"
+        "  vec2 tex = aPos * 0.5 + 0.5;\n"
+        "  vTex = vec2(tex.x, mix(tex.y, 1.0 - tex.y, uFlipY));\n"
         "}";
     static const char *fsSrc =
         "precision mediump float;\n"
@@ -1054,20 +1298,11 @@ void HWC2Window::blitRgbaToSurface(GLuint srcTex, int dw, int dh)
 
     GLuint &program = m_captureProgram;
     if (!program) {
-        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
-        glShaderSource(vs, 1, &vsSrc, NULL);
-        glCompileShader(vs);
-        GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fs, 1, &fsSrc, NULL);
-        glCompileShader(fs);
-        program = glCreateProgram();
-        glAttachShader(program, vs);
-        glAttachShader(program, fs);
-        glLinkProgram(program);
-        glDeleteShader(vs);
-        glDeleteShader(fs);
+        program = createCaptureProgram(vsSrc, fsSrc, "source-blit");
+        if (!program) return false;
     }
 
+    clearCaptureGlErrors();
     static const GLfloat verts[] = {
         -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f
     };
@@ -1075,13 +1310,26 @@ void HWC2Window::blitRgbaToSurface(GLuint srcTex, int dw, int dh)
     glUseProgram(program);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, srcTex);
-    glUniform1i(glGetUniformLocation(program, "uTex"), 0);
-    GLint aPos = glGetAttribLocation(program, "aPos");
-    glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 0, verts);
-    glEnableVertexAttribArray(aPos);
+    const GLint textureUniform = glGetUniformLocation(program, "uTex");
+    const GLint flipUniform = glGetUniformLocation(program, "uFlipY");
+    if (textureUniform < 0 || flipUniform < 0) {
+        qWarning("screencap: source-blit uniforms unavailable (texture=%d flip=%d)",
+                 textureUniform, flipUniform);
+        return false;
+    }
+    glUniform1i(textureUniform, 0);
+    glUniform1f(flipUniform, m_captureFlipY ? 1.0f : 0.0f);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
+    glEnableVertexAttribArray(0);
     glViewport(0, 0, dw, dh);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisableVertexAttribArray(aPos);
+    glDisableVertexAttribArray(0);
+    const GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        qWarning("screencap: source texture draw failed (gl=0x%x)", error);
+        return false;
+    }
+    return true;
 }
 
 int HwComposerBackend_v20::composerSequenceId = 0;
