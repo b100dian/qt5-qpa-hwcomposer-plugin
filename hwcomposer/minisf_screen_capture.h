@@ -14,20 +14,30 @@
  * counting remain inside libminisf/libdroidmedia. QPA may only retain these
  * handles and pass the native-window value to EGL.
  */
+struct MinisfScreenCaptureSessionInfo {
+    uint64_t generation;
+    int width;
+    int height;
+    int fps;
+};
+
 struct MinisfScreenCaptureApi {
-    typedef void *(*TargetAcquire)(int width, int height, uint64_t *generation);
+    typedef int (*SessionQuery)(MinisfScreenCaptureSessionInfo *info);
+    typedef void *(*TargetAcquireGeneration)(uint64_t expectedGeneration);
     typedef void *(*TargetNativeWindow)(void *target);
     typedef void (*TargetRelease)(void *target);
     typedef int (*TargetIsCurrent)(void *target, uint64_t generation);
 
-    TargetAcquire targetAcquire;
+    SessionQuery sessionQuery;
+    TargetAcquireGeneration targetAcquireGeneration;
     TargetNativeWindow targetNativeWindow;
     TargetRelease targetRelease;
+    /* Retained for standalone diagnostics; QPA uses bounded sessionQuery(). */
     TargetIsCurrent targetIsCurrent;
 
     bool valid() const {
-        return targetAcquire && targetNativeWindow && targetRelease &&
-               targetIsCurrent;
+        return sessionQuery && targetAcquireGeneration && targetNativeWindow &&
+               targetRelease;
     }
 };
 

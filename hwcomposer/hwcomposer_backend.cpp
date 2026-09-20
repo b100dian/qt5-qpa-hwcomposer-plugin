@@ -101,9 +101,12 @@ initLegacyHwComposerQuirks()
 
     if (libminisf) {
         startMiniSurfaceFlinger = (void(*)(void))android_dlsym(libminisf, "startMiniSurfaceFlinger");
-        g_minisfScreenCaptureApi.targetAcquire =
-            (MinisfScreenCaptureApi::TargetAcquire) android_dlsym(
-                libminisf, "minisf_screen_capture_target_acquire");
+        g_minisfScreenCaptureApi.sessionQuery =
+            (MinisfScreenCaptureApi::SessionQuery) android_dlsym(
+                libminisf, "minisf_screen_capture_session_query");
+        g_minisfScreenCaptureApi.targetAcquireGeneration =
+            (MinisfScreenCaptureApi::TargetAcquireGeneration) android_dlsym(
+                libminisf, "minisf_screen_capture_target_acquire_generation");
         g_minisfScreenCaptureApi.targetNativeWindow =
             (MinisfScreenCaptureApi::TargetNativeWindow) android_dlsym(
                 libminisf, "minisf_screen_capture_target_native_window");
