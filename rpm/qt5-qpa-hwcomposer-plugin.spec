@@ -48,3 +48,4 @@ rm -f %{buildroot}/%{_libdir}/cmake/Qt5Gui/Qt5Gui_QEglFShwcIntegrationPlugin.cma
 %files
 %license LICENSE.LGPLv21 LGPL_EXCEPTION.txt LICENSE.GPLv3
 %{_libdir}/qt5/plugins/platforms/libhwcomposer.so
+%{_libexecdir}/qt5-qpa-hwcomposer-plugin/hwcomposer_screencap_egl_test

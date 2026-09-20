@@ -54,6 +54,7 @@
 #include "qsystrace_selector.h"
 
 #include <inttypes.h>
+#include <time.h>
 
 /* Screen capture uses only the opaque libminisf C ABI. */
 #include "minisf_screen_capture.h"
@@ -74,6 +75,60 @@ typedef EGLImageKHR (*EglCreateImageKHR)(EGLDisplay, EGLContext, EGLenum,
                                          EGLClientBuffer, const EGLint *);
 typedef EGLBoolean (*EglDestroyImageKHR)(EGLDisplay, EGLImageKHR);
 typedef void (*GlEglImageTargetTexture2DOES)(GLenum, GLeglImageOES);
+typedef EGLBoolean (*EglPresentationTimeANDROID)(EGLDisplay, EGLSurface,
+                                                  EGLnsecsANDROID);
+
+static int64_t captureMonotonicNs()
+{
+    struct timespec ts = {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
+static EglPresentationTimeANDROID eglPresentationTimeAndroidProc()
+{
+    static EglPresentationTimeANDROID proc = nullptr;
+    if (!proc) {
+        proc = (EglPresentationTimeANDROID) eglGetProcAddress(
+            "eglPresentationTimeANDROID");
+    }
+    return proc;
+}
+
+static bool captureDebugEnabled()
+{
+    static const bool enabled = qEnvironmentVariableIsSet(
+        "QPA_HWC_SCREENCAP_DEBUG");
+    return enabled;
+}
+
+static void logCaptureConfig(EGLDisplay dpy, EGLConfig config)
+{
+    if (!captureDebugEnabled()) return;
+
+    EGLint configId = 0;
+    EGLint surfaceType = 0;
+    EGLint renderableType = 0;
+    EGLint recordable = 0;
+    EGLint visual = 0;
+    EGLint red = 0;
+    EGLint green = 0;
+    EGLint blue = 0;
+    EGLint alpha = 0;
+    eglGetConfigAttrib(dpy, config, EGL_CONFIG_ID, &configId);
+    eglGetConfigAttrib(dpy, config, EGL_SURFACE_TYPE, &surfaceType);
+    eglGetConfigAttrib(dpy, config, EGL_RENDERABLE_TYPE, &renderableType);
+    eglGetConfigAttrib(dpy, config, EGL_RECORDABLE_ANDROID, &recordable);
+    eglGetConfigAttrib(dpy, config, EGL_NATIVE_VISUAL_ID, &visual);
+    eglGetConfigAttrib(dpy, config, EGL_RED_SIZE, &red);
+    eglGetConfigAttrib(dpy, config, EGL_GREEN_SIZE, &green);
+    eglGetConfigAttrib(dpy, config, EGL_BLUE_SIZE, &blue);
+    eglGetConfigAttrib(dpy, config, EGL_ALPHA_SIZE, &alpha);
+    qDebug("screencap: EGL config id=%d surface=0x%x renderable=0x%x "
+           "recordable=%d visual=%d rgba=%d/%d/%d/%d", configId,
+           surfaceType, renderableType, recordable, visual,
+           red, green, blue, alpha);
+}
 
 static EglCreateImageKHR eglCreateImageKhrProc()
 {
@@ -177,10 +232,17 @@ class HWC2Window : public HWComposerNativeWindow
         uint64_t m_captureGeneration = 0;
         EGLSurface m_captureSurface = EGL_NO_SURFACE;
         EGLContext m_captureContext = EGL_NO_CONTEXT;
-        int m_captureFrameSkip = 1;   /* 1 = every frame */
+        int m_captureFrameSkip = 1;   /* diagnostic multiplier only */
         int m_captureFrameCounter = 0;
         int m_captureWidth = 0;
         int m_captureHeight = 0;
+        int m_captureFps = 30;
+        int64_t m_captureNextFrameNs = 0;
+        int64_t m_captureNextSessionCheckNs = 0;
+        int m_captureFrameLimit = 0;  /* Gate 2.2: one frame by default */
+        int m_captureFramesSubmitted = 0;
+        bool m_captureCandidateReady = false;
+        HWComposerNativeWindowBuffer *m_captureCandidate = nullptr;
         /* Per-source-buffer EGLImage + GL texture cache. */
         std::map<buffer_handle_t, EGLImageKHR> m_captureEglImages;
         std::map<buffer_handle_t, GLuint> m_captureTextures;
@@ -190,6 +252,7 @@ class HWC2Window : public HWComposerNativeWindow
 
         void captureInit(int width, int height);
         void captureShutdown();
+        void captureAfterPrimarySwap();
         void captureFrame(HWComposerNativeWindowBuffer *src, int width, int height);
         void blitRgbaToSurface(GLuint srcTex, int dw, int dh);
         void renderTestBars(int width, int height, int frame);
@@ -202,6 +265,7 @@ class HWC2Window : public HWComposerNativeWindow
                 hwc2_compat_display_t *display, hwc2_compat_layer_t *layer);
         ~HWC2Window();
         void set();
+        void captureAfterPrimarySwapFromBackend();
 };
 
 HWC2Window::HWC2Window(unsigned int width, unsigned int height,
@@ -220,21 +284,36 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
     m_slotCache.resize(bufferCount, nullptr);
     m_syncBeforeSet = qEnvironmentVariableIsSet("QPA_HWC_SYNC_BEFORE_SET");
 
-    /* Screen capture init (Phase 2) — enabled by env var.
-     * Must happen after the window's native buffer is available;
-     * here we just cache dims; actual BufferQueue creation is deferred
-     * to captureInit() called from the first paint when EGL is live. */
+    /* Capture is deliberately limited to post-primary-swap test bars for
+     * Gate 2.2. Do not enable source EGLImage import until this scheduling
+     * point has produced a decodable stream without disturbing lipstick. */
     m_captureWidth  = width;
     m_captureHeight = height;
     const char *capEnv = getenv("QPA_HWC_SCREENCAP");
     if (capEnv && (strcmp(capEnv, "1") == 0 || strcmp(capEnv, "true") == 0)) {
-        m_captureEnabled = true;
         const char *barsEnv = getenv("QPA_HWC_SCREENCAP_TEST_BARS");
         m_captureTestBars = barsEnv &&
             (strcmp(barsEnv, "1") == 0 || strcmp(barsEnv, "true") == 0);
+        if (!m_captureTestBars) {
+            qWarning("screencap: Gate 2.2 requires QPA_HWC_SCREENCAP_TEST_BARS=1; capture disabled");
+            return;
+        }
+
+        const char *fpsEnv = getenv("QPA_HWC_SCREENCAP_FPS");
+        if (fpsEnv) m_captureFps = atoi(fpsEnv);
+        m_captureFps = qBound(1, m_captureFps, 120);
+
+        const char *limitEnv = getenv("QPA_HWC_SCREENCAP_FRAME_LIMIT");
+        if (limitEnv) m_captureFrameLimit = atoi(limitEnv);
+        if (m_captureFrameLimit < 1) m_captureFrameLimit = 1;
+
         const char *skipEnv = getenv("QPA_HWC_SCREENCAP_FRAME_SKIP");
         if (skipEnv) m_captureFrameSkip = atoi(skipEnv);
         if (m_captureFrameSkip < 1) m_captureFrameSkip = 1;
+
+        m_captureEnabled = true;
+        qDebug("screencap: Gate 2.2 enabled: test-bars only, %d fps, limit=%d",
+               m_captureFps, m_captureFrameLimit);
     }
 }
 
@@ -291,16 +370,7 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
 
     QPA_HWC_TIMING_SAMPLE(prepareTime);
 
-    /* ---------- Screen capture (Surface input) ----------
-     * The recorder owns the MediaCodec input Surface. QPA only imports the
-     * completed display buffer, blits it into the opaque EGL window surface,
-     * and lets eglSwapBuffers() queue it to the encoder. */
-    if (m_captureEnabled && m_captureTarget == nullptr) {
-        captureInit(m_captureWidth, m_captureHeight);
-    }
-    if (m_captureEnabled && m_captureTarget != nullptr) {
-        captureFrame(buffer, m_captureWidth, m_captureHeight);
-    }
+
 
     QSystrace::begin("graphics", "QPA::set_client_target", "");
 
@@ -353,6 +423,17 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
     m_lastBuffer = buffer;
     // Prevent the buffer from being destroyed if reallocation happens
     m_lastBuffer->common.incRef(&m_lastBuffer->common);
+
+    /* queueBuffer() is still inside the primary eglSwapBuffers() call here.
+     * Record only the immediate candidate; EGL/Binder/capture work is done by
+     * HwComposerBackend_v20::swap() after that outer swap returns. */
+    if (m_captureEnabled) {
+        m_captureCandidate = buffer;
+        m_captureCandidateReady = true;
+        if (captureDebugEnabled()) {
+            qDebug("screencap: candidate recorded in present, awaiting primary swap return");
+        }
+    }
 }
 
 /* ================================================================ */
@@ -361,7 +442,7 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
 
 void HWC2Window::captureInit(int width, int height)
 {
-    if (m_captureTarget != nullptr) return;
+    if (m_captureTarget != nullptr || !m_captureEnabled) return;
 
     const MinisfScreenCaptureApi *api = minisfScreenCaptureApi();
     if (!api->valid()) {
@@ -373,8 +454,7 @@ void HWC2Window::captureInit(int width, int height)
     uint64_t generation = 0;
     void *target = api->targetAcquire(width, height, &generation);
     if (!target) {
-        /* No recorder has registered an encoder input Surface yet. This is
-         * a normal idle state, not a display failure. Retry on a later frame. */
+        /* No recorder is active. This is the normal idle state. */
         return;
     }
 
@@ -382,6 +462,7 @@ void HWC2Window::captureInit(int width, int height)
     if (!nativeWindow) {
         qWarning("screencap: target returned no native window");
         api->targetRelease(target);
+        m_captureEnabled = false;
         return;
     }
 
@@ -398,28 +479,21 @@ void HWC2Window::captureInit(int width, int height)
         EGL_NONE
     };
     EGLint numConfigs = 0;
-    if (!eglChooseConfig(dpy, configAttrs, &config, 1, &numConfigs) ||
+    if (dpy == EGL_NO_DISPLAY ||
+        !eglChooseConfig(dpy, configAttrs, &config, 1, &numConfigs) ||
         numConfigs == 0) {
         qWarning("screencap: no EGL window config for encoder Surface (0x%x)",
                  eglGetError());
         api->targetRelease(target);
+        m_captureEnabled = false;
         return;
     }
 
-    /* Match the standalone Surface-input test: create a dedicated GLES2
-     * context with the recordable config before creating the encoder window
-     * surface. Do not try to use the QSG context with a second window surface;
-     * some EGL implementations reject that combination. */
-    EGLSurface oldDraw = eglGetCurrentSurface(EGL_DRAW);
-    EGLSurface oldRead = eglGetCurrentSurface(EGL_READ);
-    EGLContext oldContext = eglGetCurrentContext();
-    if (!eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)) {
-        qWarning("screencap: cannot unbind QPA EGL surface (0x%x)",
-                 eglGetError());
-        api->targetRelease(target);
-        return;
-    }
+    logCaptureConfig(dpy, config);
 
+    /* This function is called only after the primary eglSwapBuffers() has
+     * returned. A second context/surface may be created while the primary
+     * context remains current; do not unbind it merely for creation. */
     EGLint contextAttrs[] = {
         EGL_CONTEXT_CLIENT_VERSION, 2,
         EGL_NONE
@@ -427,11 +501,10 @@ void HWC2Window::captureInit(int width, int height)
     EGLContext captureContext = eglCreateContext(
         dpy, config, EGL_NO_CONTEXT, contextAttrs);
     if (captureContext == EGL_NO_CONTEXT) {
-        EGLint error = eglGetError();
-        eglMakeCurrent(dpy, oldDraw, oldRead, oldContext);
         qWarning("screencap: eglCreateContext failed for encoder Surface (0x%x)",
-                 error);
+                 eglGetError());
         api->targetRelease(target);
+        m_captureEnabled = false;
         return;
     }
 
@@ -440,16 +513,16 @@ void HWC2Window::captureInit(int width, int height)
     if (surface == EGL_NO_SURFACE) {
         EGLint error = eglGetError();
         eglDestroyContext(dpy, captureContext);
-        eglMakeCurrent(dpy, oldDraw, oldRead, oldContext);
         qWarning("screencap: eglCreateWindowSurface failed for encoder Surface (0x%x)",
                  error);
         api->targetRelease(target);
+        m_captureEnabled = false;
         return;
     }
 
-    /* The encoder Surface has no display-vsync producer. Match the standalone
-     * Surface-input test and disable EGL swap throttling before the first
-     * capture frame, otherwise eglSwapBuffers() can wait forever. */
+    EGLSurface oldDraw = eglGetCurrentSurface(EGL_DRAW);
+    EGLSurface oldRead = eglGetCurrentSurface(EGL_READ);
+    EGLContext oldContext = eglGetCurrentContext();
     if (!eglMakeCurrent(dpy, surface, surface, captureContext) ||
         !eglSwapInterval(dpy, 0)) {
         EGLint error = eglGetError();
@@ -458,6 +531,7 @@ void HWC2Window::captureInit(int width, int height)
         eglDestroyContext(dpy, captureContext);
         qWarning("screencap: cannot configure encoder Surface (0x%x)", error);
         api->targetRelease(target);
+        m_captureEnabled = false;
         return;
     }
     if (!eglMakeCurrent(dpy, oldDraw, oldRead, oldContext)) {
@@ -467,6 +541,7 @@ void HWC2Window::captureInit(int width, int height)
         qWarning("screencap: failed to restore QPA EGL surfaces (0x%x)",
                  error);
         api->targetRelease(target);
+        m_captureEnabled = false;
         return;
     }
 
@@ -475,8 +550,10 @@ void HWC2Window::captureInit(int width, int height)
     m_captureGeneration = generation;
     m_captureSurface = surface;
     m_captureContext = captureContext;
-    qDebug("screencap: encoder Surface target=%p generation=%" PRIu64,
-           target, generation);
+    if (captureDebugEnabled()) {
+        qDebug("screencap: encoder Surface target=%p generation=%" PRIu64,
+               target, generation);
+    }
 }
 
 void HWC2Window::captureShutdown()
@@ -537,6 +614,45 @@ void HWC2Window::captureShutdown()
     }
     m_captureTarget = nullptr;
     m_captureGeneration = 0;
+}
+
+void HWC2Window::captureAfterPrimarySwapFromBackend()
+{
+    captureAfterPrimarySwap();
+}
+
+void HWC2Window::captureAfterPrimarySwap()
+{
+    if (!m_captureCandidateReady) return;
+    m_captureCandidateReady = false;
+    HWComposerNativeWindowBuffer *candidate = m_captureCandidate;
+    m_captureCandidate = nullptr;
+
+    if (!m_captureEnabled || candidate == nullptr) return;
+    if (m_captureFramesSubmitted >= m_captureFrameLimit) {
+        m_captureEnabled = false;
+        captureShutdown();
+        return;
+    }
+
+    const int64_t nowNs = captureMonotonicNs();
+    if (m_captureTarget == nullptr) {
+        if (nowNs < m_captureNextSessionCheckNs) return;
+        m_captureNextSessionCheckNs = nowNs + 250000000LL;
+        captureInit(m_captureWidth, m_captureHeight);
+        if (m_captureTarget == nullptr) return;
+    }
+
+    if (nowNs < m_captureNextFrameNs) return;
+    m_captureNextFrameNs = nowNs + 1000000000LL / m_captureFps;
+
+    if (++m_captureFrameCounter % m_captureFrameSkip != 0) return;
+    if (captureDebugEnabled()) {
+        qDebug("screencap: primary swap returned at %" PRId64
+               "; submitting test-bars frame %d", nowNs,
+               m_captureFramesSubmitted + 1);
+    }
+    captureFrame(candidate, m_captureWidth, m_captureHeight);
 }
 
 static EGLImageKHR ensureEglImage(EGLDisplay dpy, buffer_handle_t h,
@@ -617,11 +733,21 @@ struct GlStateGuard {
 
 void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int height)
 {
-    if (++m_captureFrameCounter % m_captureFrameSkip != 0) return;
+    Q_UNUSED(src);
 
     const MinisfScreenCaptureApi *api = minisfScreenCaptureApi();
     if (!api->valid() || !m_captureTarget ||
         !api->targetIsCurrent(m_captureTarget, m_captureGeneration)) {
+        qWarning("screencap: encoder target became stale");
+        m_captureEnabled = false;
+        captureShutdown();
+        return;
+    }
+
+    EglPresentationTimeANDROID presentationTime = eglPresentationTimeAndroidProc();
+    if (!presentationTime) {
+        qWarning("screencap: eglPresentationTimeANDROID is unavailable");
+        m_captureEnabled = false;
         captureShutdown();
         return;
     }
@@ -630,44 +756,63 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src, int width, int 
     EGLSurface oldDraw = eglGetCurrentSurface(EGL_DRAW);
     EGLSurface oldRead = eglGetCurrentSurface(EGL_READ);
     EGLContext ctx = eglGetCurrentContext();
-
-    if (m_captureContext == EGL_NO_CONTEXT ||
+    if (dpy == EGL_NO_DISPLAY || m_captureContext == EGL_NO_CONTEXT ||
         !eglMakeCurrent(dpy, m_captureSurface, m_captureSurface,
                         m_captureContext)) {
         qWarning("screencap: cannot make encoder Surface current (0x%x)",
                  eglGetError());
+        m_captureEnabled = false;
         captureShutdown();
         return;
     }
 
-    if (m_captureTestBars) {
-        renderTestBars(width, height, m_captureFrameCounter);
-    } else {
-        GLuint srcTex = 0;
-        if (ensureEglImage(dpy, src->handle, m_captureEglImages,
-                          m_captureTextures, srcTex) == EGL_NO_IMAGE_KHR) {
-            eglMakeCurrent(dpy, oldDraw, oldRead, ctx);
-            qWarning("screencap: source EGLImage import failed (0x%x)",
-                     eglGetError());
-            return;
-        }
-
-        blitRgbaToSurface(srcTex, width, height);
+    /* Gate 2.2 intentionally proves only the safe scheduling point. Source
+     * EGLImage import is forbidden until these test bars have passed. */
+    if (!m_captureTestBars) {
+        qWarning("screencap: real source capture is not enabled at Gate 2.2");
+        eglMakeCurrent(dpy, oldDraw, oldRead, ctx);
+        m_captureEnabled = false;
+        captureShutdown();
+        return;
     }
+
+    renderTestBars(width, height, m_captureFramesSubmitted);
     glFlush();
-    EGLBoolean swapped = eglSwapBuffers(dpy, m_captureSurface);
+
+    const int64_t timestampNs = captureMonotonicNs();
+    EGLBoolean timestamped = presentationTime(
+        dpy, m_captureSurface, static_cast<EGLnsecsANDROID>(timestampNs));
+    EGLint timestampError = timestamped ? EGL_SUCCESS : eglGetError();
+    EGLBoolean swapped = timestamped && eglSwapBuffers(dpy, m_captureSurface);
     EGLint swapError = swapped ? EGL_SUCCESS : eglGetError();
 
-    /* Always restore the QPA draw/read surfaces before releasing a failed
-     * encoder target. The capture surface must never remain current after
-     * captureShutdown() destroys it. */
+    /* Always restore QPA's primary surfaces before capture teardown. */
     if (!eglMakeCurrent(dpy, oldDraw, oldRead, ctx)) {
         qWarning("screencap: failed to restore QPA EGL surfaces (0x%x)",
                  eglGetError());
     }
 
+    if (!timestamped) {
+        qWarning("screencap: eglPresentationTimeANDROID failed (0x%x)",
+                 timestampError);
+        m_captureEnabled = false;
+        captureShutdown();
+        return;
+    }
     if (!swapped) {
         qWarning("screencap: encoder eglSwapBuffers failed (0x%x)", swapError);
+        m_captureEnabled = false;
+        captureShutdown();
+        return;
+    }
+
+    ++m_captureFramesSubmitted;
+    qDebug("screencap: submitted test-bars frame %d pts=%" PRId64,
+           m_captureFramesSubmitted, timestampNs);
+
+    if (m_captureFramesSubmitted >= m_captureFrameLimit) {
+        qDebug("screencap: Gate 2.2 frame limit reached; disabling capture");
+        m_captureEnabled = false;
         captureShutdown();
     }
 }
@@ -785,6 +930,7 @@ HwComposerBackend_v20::HwComposerBackend_v20(hw_module_t *hwc_module, void *libm
     , hwc2_primary_display(NULL)
     , hwc2_primary_layer(NULL)
     , m_displayOff(true)
+    , m_primaryWindow(nullptr)
 {
     procs = new HwcProcs_v20();
     procs->on_vsync_received = hwc2_callback_vsync;
@@ -857,6 +1003,7 @@ HwComposerBackend_v20::createWindow(int width, int height)
     HWC2Window *hwc_win = new HWC2Window(width, height,
                                          HAL_PIXEL_FORMAT_RGBA_8888,
                                          hwc2_primary_display, layer);
+    m_primaryWindow = hwc_win;
 
     return (EGLNativeWindowType) static_cast<ANativeWindow *>(hwc_win);
 }
@@ -874,7 +1021,16 @@ HwComposerBackend_v20::swap(EGLNativeDisplayType display, EGLSurface surface)
     timer.start();
 #endif
 
-    eglSwapBuffers(display, surface);
+    /* HWC2Window::present() is synchronously reached from this primary swap's
+     * queueBuffer() callback. Do not run capture there. This call happens only
+     * after the outer eglSwapBuffers() has returned to QPA. */
+    EGLBoolean primarySwapped = eglSwapBuffers(display, surface);
+    if (!primarySwapped) {
+        qWarning("HWComposerBackend::swap: primary eglSwapBuffers failed (0x%x)",
+                 eglGetError());
+    } else if (m_primaryWindow != nullptr) {
+        m_primaryWindow->captureAfterPrimarySwapFromBackend();
+    }
 
 #ifdef QPA_HWC_TIMING
     qDebug("HWComposerBackend::swap(), present=%.3f, sync=%.3f, prepare=%.3f, set=%.3f, total=%.3f",
