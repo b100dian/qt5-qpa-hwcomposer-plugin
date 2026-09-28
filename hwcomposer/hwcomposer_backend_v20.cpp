@@ -103,6 +103,23 @@ static bool captureDebugEnabled()
     return enabled;
 }
 
+/* Compares the requested session size against the native display size and
+ * returns the rotation (clockwise degrees) that reconciles them: 0 for an
+ * exact match, `landscapeRotation` if the session is the native size with
+ * width/height swapped (and the native size isn't square, so the swap is
+ * meaningful), or -1 if neither applies and the session must be rejected. */
+static int captureSessionRotation(int nativeWidth, int nativeHeight,
+                                  int sessionWidth, int sessionHeight,
+                                  int landscapeRotation)
+{
+    if (sessionWidth == nativeWidth && sessionHeight == nativeHeight) return 0;
+    if (nativeWidth != nativeHeight &&
+        sessionWidth == nativeHeight && sessionHeight == nativeWidth) {
+        return landscapeRotation;
+    }
+    return -1;
+}
+
 static void logCaptureConfig(EGLDisplay dpy, EGLConfig config)
 {
     if (!captureDebugEnabled()) return;
@@ -259,6 +276,10 @@ class HWC2Window : public HWComposerNativeWindow
         bool m_captureTestBars = false;
         bool m_captureSource = false;
         bool m_captureFlipY = false;
+        int m_captureLandscapeRotation = 270;  /* configured direction: 90 or 270 */
+        int m_captureRotation = 0;            /* current session: 0, 90 or 270 */
+        int m_captureOutputWidth = 0;          /* session (encoder) size */
+        int m_captureOutputHeight = 0;
 
         void captureInit(const MinisfScreenCaptureSessionInfo &info);
         void captureShutdown();
@@ -316,6 +337,17 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
         }
         m_captureFlipY = qEnvironmentVariableIsSet("QPA_HWC_SCREENCAP_FLIP_Y");
 
+        const char *rotEnv = getenv("QPA_HWC_SCREENCAP_LANDSCAPE_ROTATION");
+        if (rotEnv) {
+            const int rot = atoi(rotEnv);
+            if (rot == 90 || rot == 270) {
+                m_captureLandscapeRotation = rot;
+            } else {
+                qWarning("screencap: QPA_HWC_SCREENCAP_LANDSCAPE_ROTATION must be "
+                         "90 or 270; using 270");
+            }
+        }
+
         const char *fpsEnv = getenv("QPA_HWC_SCREENCAP_FPS");
         if (fpsEnv) {
             m_captureFpsOverride = qBound(1, atoi(fpsEnv), 120);
@@ -330,11 +362,13 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
         if (m_captureFrameSkip < 1) m_captureFrameSkip = 1;
 
         m_captureEnabled = true;
-        qDebug("screencap: post-swap %s enabled: fps=%s, limit=%d%s",
+        qDebug("screencap: post-swap %s enabled: fps=%s, limit=%d%s, "
+               "landscape rotation=%d",
                m_captureTestBars ? "test bars" : "HWC source",
                m_captureFpsOverride ? "environment override" : "recorder session",
                m_captureFrameLimit,
-               m_captureSource && m_captureFlipY ? ", vertical flip" : "");
+               m_captureSource && m_captureFlipY ? ", vertical flip" : "",
+               m_captureLandscapeRotation);
     }
 }
 
@@ -780,13 +814,18 @@ void HWC2Window::captureAfterPrimarySwap()
             return;
         }
 
-        if (info.width != m_captureWidth || info.height != m_captureHeight ||
-            info.fps <= 0) {
+        const int rotation = info.fps > 0
+            ? captureSessionRotation(m_captureWidth, m_captureHeight,
+                                     info.width, info.height,
+                                     m_captureLandscapeRotation)
+            : -1;
+        if (rotation < 0) {
             if (m_captureFailedGeneration != info.generation) {
                 qWarning("screencap: rejecting generation=%" PRIu64
-                         " session=%dx%d@%d display=%dx%d",
+                         " session=%dx%d@%d display=%dx%d (also accepts %dx%d)",
                          info.generation, info.width, info.height, info.fps,
-                         m_captureWidth, m_captureHeight);
+                         m_captureWidth, m_captureHeight,
+                         m_captureHeight, m_captureWidth);
             }
             m_captureFailedGeneration = info.generation;
             if (m_captureTarget != nullptr) captureShutdown();
@@ -795,9 +834,12 @@ void HWC2Window::captureAfterPrimarySwap()
 
         if (m_captureObservedGeneration != info.generation) {
             qDebug("screencap: recorder session generation=%" PRIu64
-                   " %dx%d@%d", info.generation, info.width, info.height,
-                   info.fps);
+                   " %dx%d@%d rotation=%d", info.generation, info.width,
+                   info.height, info.fps, rotation);
             m_captureObservedGeneration = info.generation;
+            m_captureRotation = rotation;
+            m_captureOutputWidth = info.width;
+            m_captureOutputHeight = info.height;
             m_captureFramesSubmitted = 0;
             m_captureFrameCounter = 0;
             m_captureNextFrameNs = 0;
@@ -835,7 +877,7 @@ void HWC2Window::captureAfterPrimarySwap()
                frameNowNs, m_captureFramesSubmitted + 1, m_captureGeneration);
     }
     captureFrame(candidate, candidateFence.fd, candidateFenceValid,
-                 m_captureWidth, m_captureHeight);
+                 m_captureOutputWidth, m_captureOutputHeight);
 }
 
 static bool captureHasExtension(const char *extensions, const char *name)
@@ -1283,9 +1325,12 @@ bool HWC2Window::blitRgbaToSurface(GLuint srcTex, int dw, int dh)
         "attribute vec2 aPos;\n"
         "varying vec2 vTex;\n"
         "uniform float uFlipY;\n"
+        "uniform float uRotation;\n"  /* 0 = none, 1 = 90 CW, 2 = 270 CW */
         "void main() {\n"
         "  gl_Position = vec4(aPos, 0.0, 1.0);\n"
         "  vec2 tex = aPos * 0.5 + 0.5;\n"
+        "  if (uRotation > 1.5) tex = vec2(tex.y, 1.0 - tex.x);\n"
+        "  else if (uRotation > 0.5) tex = vec2(1.0 - tex.y, tex.x);\n"
         "  vTex = vec2(tex.x, mix(tex.y, 1.0 - tex.y, uFlipY));\n"
         "}";
     static const char *fsSrc =
@@ -1312,13 +1357,17 @@ bool HWC2Window::blitRgbaToSurface(GLuint srcTex, int dw, int dh)
     glBindTexture(GL_TEXTURE_2D, srcTex);
     const GLint textureUniform = glGetUniformLocation(program, "uTex");
     const GLint flipUniform = glGetUniformLocation(program, "uFlipY");
-    if (textureUniform < 0 || flipUniform < 0) {
-        qWarning("screencap: source-blit uniforms unavailable (texture=%d flip=%d)",
-                 textureUniform, flipUniform);
+    const GLint rotationUniform = glGetUniformLocation(program, "uRotation");
+    if (textureUniform < 0 || flipUniform < 0 || rotationUniform < 0) {
+        qWarning("screencap: source-blit uniforms unavailable (texture=%d flip=%d "
+                 "rotation=%d)", textureUniform, flipUniform, rotationUniform);
         return false;
     }
     glUniform1i(textureUniform, 0);
     glUniform1f(flipUniform, m_captureFlipY ? 1.0f : 0.0f);
+    glUniform1f(rotationUniform,
+                m_captureRotation == 270 ? 2.0f :
+                m_captureRotation == 90 ? 1.0f : 0.0f);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
     glEnableVertexAttribArray(0);
     glViewport(0, 0, dw, dh);
