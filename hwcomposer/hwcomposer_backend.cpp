@@ -40,6 +40,8 @@
 ****************************************************************************/
 
 #include <dlfcn.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "hwcomposer_backend.h"
 #include "minisf_screen_capture.h"
@@ -62,6 +64,83 @@ static MinisfScreenCaptureApi g_minisfScreenCaptureApi = {};
 const MinisfScreenCaptureApi *minisfScreenCaptureApi()
 {
     return &g_minisfScreenCaptureApi;
+}
+
+/* Resolve the optional screen-capture entry points from an already loaded
+ * libminisf. Missing symbols leave the API invalid, which every caller
+ * checks with MinisfScreenCaptureApi::valid(). */
+static void
+resolveMinisfScreenCaptureApi(void *libminisf)
+{
+    if (!libminisf) {
+        return;
+    }
+
+    g_minisfScreenCaptureApi.sessionQuery =
+        (MinisfScreenCaptureApi::SessionQuery) android_dlsym(
+            libminisf, "minisf_screen_capture_session_query");
+    g_minisfScreenCaptureApi.targetAcquireGeneration =
+        (MinisfScreenCaptureApi::TargetAcquireGeneration) android_dlsym(
+            libminisf, "minisf_screen_capture_target_acquire_generation");
+    g_minisfScreenCaptureApi.targetNativeWindow =
+        (MinisfScreenCaptureApi::TargetNativeWindow) android_dlsym(
+            libminisf, "minisf_screen_capture_target_native_window");
+    g_minisfScreenCaptureApi.targetRelease =
+        (MinisfScreenCaptureApi::TargetRelease) android_dlsym(
+            libminisf, "minisf_screen_capture_target_release");
+    g_minisfScreenCaptureApi.targetIsCurrent =
+        (MinisfScreenCaptureApi::TargetIsCurrent) android_dlsym(
+            libminisf, "minisf_screen_capture_target_is_current");
+}
+
+/*
+ * Screen capture needs libminisf: it resolves the capture symbols and, via
+ * startMiniSurfaceFlinger(), hosts the sailfish.screencap Binder service and
+ * starts this process's Binder thread pool. Upstream deliberately passes NULL
+ * on the HWC2 paths, so doing this unconditionally changes the behaviour of
+ * every process that loads the plugin, including early-boot system services
+ * such as systemd-ask-password-gui.
+ *
+ * Therefore do it only when capture was explicitly requested. A process that
+ * does not record behaves exactly as upstream.
+ */
+static void *
+initScreenCaptureQuirks()
+{
+    void *libminisf;
+    void (*startMiniSurfaceFlinger)(void) = NULL;
+
+    /* Same spelling as the capture mode check in HwComposerBackend_v20. */
+    const char *capEnv = getenv("QPA_HWC_SCREENCAP");
+    if (!capEnv || (strcmp(capEnv, "1") != 0 && strcmp(capEnv, "true") != 0)) {
+        return NULL;
+    }
+
+    libminisf = android_dlopen("libminisf.so", RTLD_LAZY);
+    if (!libminisf) {
+        qWarning("screencap: libminisf.so is not available; capture disabled");
+        return NULL;
+    }
+
+    resolveMinisfScreenCaptureApi(libminisf);
+    if (!minisfScreenCaptureApi()->valid()) {
+        qWarning("screencap: libminisf has no Surface-input session API; "
+                 "capture disabled");
+    }
+
+    /* Required: ScreenCaptureService, which the recorder looks up as
+     * sailfish.screencap, is instantiated by startMiniSurfaceFlinger(), and
+     * serving it needs the Binder thread pool it starts. */
+    startMiniSurfaceFlinger =
+        (void(*)(void)) android_dlsym(libminisf, "startMiniSurfaceFlinger");
+    if (startMiniSurfaceFlinger) {
+        startMiniSurfaceFlinger();
+    } else {
+        qWarning("screencap: libminisf has no startMiniSurfaceFlinger; the "
+                 "sailfish.screencap service will not be available");
+    }
+
+    return libminisf;
 }
 
 HwComposerBackend::HwComposerBackend(hw_module_t *hwc_module, void *libmsf)
@@ -101,21 +180,7 @@ initLegacyHwComposerQuirks()
 
     if (libminisf) {
         startMiniSurfaceFlinger = (void(*)(void))android_dlsym(libminisf, "startMiniSurfaceFlinger");
-        g_minisfScreenCaptureApi.sessionQuery =
-            (MinisfScreenCaptureApi::SessionQuery) android_dlsym(
-                libminisf, "minisf_screen_capture_session_query");
-        g_minisfScreenCaptureApi.targetAcquireGeneration =
-            (MinisfScreenCaptureApi::TargetAcquireGeneration) android_dlsym(
-                libminisf, "minisf_screen_capture_target_acquire_generation");
-        g_minisfScreenCaptureApi.targetNativeWindow =
-            (MinisfScreenCaptureApi::TargetNativeWindow) android_dlsym(
-                libminisf, "minisf_screen_capture_target_native_window");
-        g_minisfScreenCaptureApi.targetRelease =
-            (MinisfScreenCaptureApi::TargetRelease) android_dlsym(
-                libminisf, "minisf_screen_capture_target_release");
-        g_minisfScreenCaptureApi.targetIsCurrent =
-            (MinisfScreenCaptureApi::TargetIsCurrent) android_dlsym(
-                libminisf, "minisf_screen_capture_target_is_current");
+        resolveMinisfScreenCaptureApi(libminisf);
     }
 
     if (startMiniSurfaceFlinger) {
@@ -137,7 +202,7 @@ HwComposerBackend::create()
         // Create hwcomposer backend directly without opening hardware module
         // because on some devices loading hwc2 module twice breaks graphics
         // (The first load is in the composer android service.)
-        return new HwComposerBackend_v20(NULL, initLegacyHwComposerQuirks());
+        return new HwComposerBackend_v20(NULL, initScreenCaptureQuirks());
     }
 #endif
 
@@ -205,7 +270,7 @@ HwComposerBackend::create()
 #endif /* HWC_PLUGIN_HAVE_HWCOMPOSER1_API */
 #ifdef HWC_PLUGIN_HAVE_HWCOMPOSER2_API
             case HWC_DEVICE_API_VERSION_2_0:
-                return new HwComposerBackend_v20(NULL, initLegacyHwComposerQuirks());
+                return new HwComposerBackend_v20(NULL, initScreenCaptureQuirks());
 #endif
             default:
                 fprintf(stderr, "Unknown hwcomposer API: 0x%x/0x%x/0x%x\n",
@@ -218,7 +283,7 @@ HwComposerBackend::create()
 #ifdef HWC_PLUGIN_HAVE_HWCOMPOSER2_API
     else {
         // Create hwc2 backend directly if opening hardware module fails
-        return new HwComposerBackend_v20(NULL, initLegacyHwComposerQuirks());
+        return new HwComposerBackend_v20(NULL, initScreenCaptureQuirks());
     }
 #endif
 
