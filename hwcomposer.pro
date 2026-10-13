@@ -1,2 +1,2 @@
 TEMPLATE = subdirs
-SUBDIRS = hwcomposer tools
+SUBDIRS = hwcomposer
