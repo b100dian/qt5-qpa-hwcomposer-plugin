@@ -96,13 +96,6 @@ static EglPresentationTimeANDROID eglPresentationTimeAndroidProc()
     return proc;
 }
 
-static bool captureDebugEnabled()
-{
-    static const bool enabled = qEnvironmentVariableIsSet(
-        "QPA_HWC_SCREENCAP_DEBUG");
-    return enabled;
-}
-
 /* Compares the requested session size against the native display size and
  * returns the rotation (clockwise degrees) that reconciles them: 0 for an
  * exact match, `landscapeRotation` if the session is the native size with
@@ -118,34 +111,6 @@ static int captureSessionRotation(int nativeWidth, int nativeHeight,
         return landscapeRotation;
     }
     return -1;
-}
-
-static void logCaptureConfig(EGLDisplay dpy, EGLConfig config)
-{
-    if (!captureDebugEnabled()) return;
-
-    EGLint configId = 0;
-    EGLint surfaceType = 0;
-    EGLint renderableType = 0;
-    EGLint recordable = 0;
-    EGLint visual = 0;
-    EGLint red = 0;
-    EGLint green = 0;
-    EGLint blue = 0;
-    EGLint alpha = 0;
-    eglGetConfigAttrib(dpy, config, EGL_CONFIG_ID, &configId);
-    eglGetConfigAttrib(dpy, config, EGL_SURFACE_TYPE, &surfaceType);
-    eglGetConfigAttrib(dpy, config, EGL_RENDERABLE_TYPE, &renderableType);
-    eglGetConfigAttrib(dpy, config, EGL_RECORDABLE_ANDROID, &recordable);
-    eglGetConfigAttrib(dpy, config, EGL_NATIVE_VISUAL_ID, &visual);
-    eglGetConfigAttrib(dpy, config, EGL_RED_SIZE, &red);
-    eglGetConfigAttrib(dpy, config, EGL_GREEN_SIZE, &green);
-    eglGetConfigAttrib(dpy, config, EGL_BLUE_SIZE, &blue);
-    eglGetConfigAttrib(dpy, config, EGL_ALPHA_SIZE, &alpha);
-    qDebug("screencap: EGL config id=%d surface=0x%x renderable=0x%x "
-           "recordable=%d visual=%d rgba=%d/%d/%d/%d", configId,
-           surfaceType, renderableType, recordable, visual,
-           red, green, blue, alpha);
 }
 
 static EglCreateImageKHR eglCreateImageKhrProc()
@@ -251,20 +216,14 @@ class HWC2Window : public HWComposerNativeWindow
         EGLDisplay m_captureDisplay = EGL_NO_DISPLAY;
         EGLSurface m_captureSurface = EGL_NO_SURFACE;
         EGLContext m_captureContext = EGL_NO_CONTEXT;
-        int m_captureFrameSkip = 1;   /* diagnostic multiplier only */
-        int m_captureFrameCounter = 0;
         int m_captureWidth = 0;
         int m_captureHeight = 0;
         int m_captureFps = 30;
-        int m_captureFpsOverride = 0;
         int64_t m_captureNextFrameNs = 0;
         int64_t m_captureNextSessionCheckNs = 0;
-        int m_captureFrameLimit = 0;  /* 0 = unlimited; use an explicit limit for diagnostics */
-        int m_captureFramesSubmitted = 0;
         uint64_t m_captureFailedGeneration = 0;
         uint64_t m_captureObservedGeneration = 0;
         bool m_captureCandidateReady = false;
-        bool m_captureCandidateLogged = false;
         bool m_captureCandidateFenceValid = true;
         int m_captureCandidateFenceFd = -1;
         HWComposerNativeWindowBuffer *m_captureCandidate = nullptr;
@@ -272,10 +231,6 @@ class HWC2Window : public HWComposerNativeWindow
         std::map<buffer_handle_t, EGLImageKHR> m_captureEglImages;
         std::map<buffer_handle_t, GLuint> m_captureTextures;
         GLuint m_captureProgram = 0;
-        GLuint m_captureBarsProgram = 0;
-        bool m_captureTestBars = false;
-        bool m_captureSource = false;
-        bool m_captureFlipY = false;
         int m_captureLandscapeRotation = 270;  /* configured direction: 90 or 270 */
         int m_captureRotation = 0;            /* current session: 0, 90 or 270 */
         int m_captureOutputWidth = 0;          /* session (encoder) size */
@@ -288,7 +243,6 @@ class HWC2Window : public HWComposerNativeWindow
         void captureFrame(HWComposerNativeWindowBuffer *src, int sourceFenceFd,
                           bool sourceFenceValid, int width, int height);
         bool blitRgbaToSurface(GLuint srcTex, int dw, int dh);
-        bool renderTestBars(int width, int height, int frame);
     protected:
         void present(HWComposerNativeWindowBuffer *buffer);
 
@@ -317,26 +271,10 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
     m_slotCache.resize(bufferCount, nullptr);
     m_syncBeforeSet = qEnvironmentVariableIsSet("QPA_HWC_SYNC_BEFORE_SET");
 
-    /* Capture mode is explicit so test bars remain available independently of
-     * the Gate 3 source EGLImage path. */
     m_captureWidth  = width;
     m_captureHeight = height;
     const char *capEnv = getenv("QPA_HWC_SCREENCAP");
     if (capEnv && (strcmp(capEnv, "1") == 0 || strcmp(capEnv, "true") == 0)) {
-        const char *barsEnv = getenv("QPA_HWC_SCREENCAP_TEST_BARS");
-        m_captureTestBars = barsEnv &&
-            (strcmp(barsEnv, "1") == 0 || strcmp(barsEnv, "true") == 0);
-        const char *sourceEnv = getenv("QPA_HWC_SCREENCAP_SOURCE");
-        m_captureSource = sourceEnv &&
-            (strcmp(sourceEnv, "1") == 0 || strcmp(sourceEnv, "true") == 0);
-        if (m_captureTestBars == m_captureSource) {
-            qWarning("screencap: select exactly one mode with "
-                     "QPA_HWC_SCREENCAP_TEST_BARS=1 or QPA_HWC_SCREENCAP_SOURCE=1; "
-                     "capture disabled");
-            return;
-        }
-        m_captureFlipY = qEnvironmentVariableIsSet("QPA_HWC_SCREENCAP_FLIP_Y");
-
         const char *rotEnv = getenv("QPA_HWC_SCREENCAP_LANDSCAPE_ROTATION");
         if (rotEnv) {
             const int rot = atoi(rotEnv);
@@ -348,26 +286,8 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
             }
         }
 
-        const char *fpsEnv = getenv("QPA_HWC_SCREENCAP_FPS");
-        if (fpsEnv) {
-            m_captureFpsOverride = qBound(1, atoi(fpsEnv), 120);
-        }
-
-        const char *limitEnv = getenv("QPA_HWC_SCREENCAP_FRAME_LIMIT");
-        if (limitEnv) m_captureFrameLimit = atoi(limitEnv);
-        if (m_captureFrameLimit < 0) m_captureFrameLimit = 0;
-
-        const char *skipEnv = getenv("QPA_HWC_SCREENCAP_FRAME_SKIP");
-        if (skipEnv) m_captureFrameSkip = atoi(skipEnv);
-        if (m_captureFrameSkip < 1) m_captureFrameSkip = 1;
-
         m_captureEnabled = true;
-        qDebug("screencap: post-swap %s enabled: fps=%s, limit=%d%s, "
-               "landscape rotation=%d",
-               m_captureTestBars ? "test bars" : "HWC source",
-               m_captureFpsOverride ? "environment override" : "recorder session",
-               m_captureFrameLimit,
-               m_captureSource && m_captureFlipY ? ", vertical flip" : "",
+        qDebug("screencap: enabled, landscape rotation=%d",
                m_captureLandscapeRotation);
     }
 }
@@ -454,7 +374,7 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
 
     int captureFenceFd = -1;
     bool captureFenceValid = true;
-    if (m_captureEnabled && m_captureSource && acquireFenceFd >= 0) {
+    if (m_captureEnabled && acquireFenceFd >= 0) {
         captureFenceFd = dup(acquireFenceFd);
         captureFenceValid = captureFenceFd >= 0;
     }
@@ -501,10 +421,6 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
         m_captureCandidateFenceFd = captureFenceFd;
         m_captureCandidateFenceValid = captureFenceValid;
         m_captureCandidateReady = true;
-        if (captureDebugEnabled() && !m_captureCandidateLogged) {
-            m_captureCandidateLogged = true;
-            qDebug("screencap: candidate recorded in present, awaiting primary swap return");
-        }
     } else if (captureFenceFd >= 0) {
         close(captureFenceFd);
     }
@@ -526,13 +442,7 @@ void HWC2Window::captureInit(const MinisfScreenCaptureSessionInfo &info)
         return;
     }
 
-    const int64_t acquireStartNs = captureMonotonicNs();
     void *target = api->targetAcquireGeneration(info.generation);
-    const int64_t acquireDurationNs = captureMonotonicNs() - acquireStartNs;
-    if (captureDebugEnabled()) {
-        qDebug("screencap: target acquire generation=%" PRIu64 " took %.3fms",
-               info.generation, acquireDurationNs / 1000000.0);
-    }
     if (!target) {
         /* The recorder changed between query and acquire. Retry after the next
          * bounded session query; this is not a failed generation. */
@@ -572,8 +482,6 @@ void HWC2Window::captureInit(const MinisfScreenCaptureSessionInfo &info)
         return;
     }
 
-    logCaptureConfig(dpy, config);
-
     /* This function is called only after the primary eglSwapBuffers() has
      * returned. A second context/surface may be created while the primary
      * context remains current; do not unbind it merely for creation. */
@@ -581,10 +489,8 @@ void HWC2Window::captureInit(const MinisfScreenCaptureSessionInfo &info)
         EGL_CONTEXT_CLIENT_VERSION, 2,
         EGL_NONE
     };
-    const int64_t contextStartNs = captureMonotonicNs();
     EGLContext captureContext = eglCreateContext(
         dpy, config, EGL_NO_CONTEXT, contextAttrs);
-    const int64_t contextDurationNs = captureMonotonicNs() - contextStartNs;
     if (captureContext == EGL_NO_CONTEXT) {
         EGLint error = eglGetError();
         qWarning("screencap: eglCreateContext failed for generation=%" PRIu64
@@ -594,10 +500,8 @@ void HWC2Window::captureInit(const MinisfScreenCaptureSessionInfo &info)
         return;
     }
 
-    const int64_t surfaceStartNs = captureMonotonicNs();
     EGLSurface surface = eglCreateWindowSurface(
         dpy, config, (EGLNativeWindowType) nativeWindow, nullptr);
-    const int64_t surfaceDurationNs = captureMonotonicNs() - surfaceStartNs;
     if (surface == EGL_NO_SURFACE) {
         EGLint error = eglGetError();
         eglDestroyContext(dpy, captureContext);
@@ -662,12 +566,6 @@ void HWC2Window::captureInit(const MinisfScreenCaptureSessionInfo &info)
     m_captureDisplay = dpy;
     m_captureSurface = surface;
     m_captureContext = captureContext;
-    if (captureDebugEnabled()) {
-        qDebug("screencap: encoder Surface target=%p generation=%" PRIu64
-               " context=%.3fms surface=%.3fms", target, info.generation,
-               contextDurationNs / 1000000.0,
-               surfaceDurationNs / 1000000.0);
-    }
 }
 
 void HWC2Window::captureShutdown()
@@ -695,9 +593,6 @@ void HWC2Window::captureShutdown()
         if (m_captureProgram) {
             glDeleteProgram(m_captureProgram);
         }
-        if (m_captureBarsProgram) {
-            glDeleteProgram(m_captureBarsProgram);
-        }
     }
     if (dpy != EGL_NO_DISPLAY) {
         EglDestroyImageKHR destroyImage = eglDestroyImageKhrProc();
@@ -712,7 +607,6 @@ void HWC2Window::captureShutdown()
     m_captureEglImages.clear();
     m_captureTextures.clear();
     m_captureProgram = 0;
-    m_captureBarsProgram = 0;
 
     if (dpy != EGL_NO_DISPLAY && m_captureContext != EGL_NO_CONTEXT) {
         eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -773,12 +667,6 @@ void HWC2Window::captureAfterPrimarySwap()
     m_captureCandidateFenceValid = true;
 
     if (!m_captureEnabled || candidate == nullptr) return;
-    if (m_captureFrameLimit > 0 &&
-        m_captureFramesSubmitted >= m_captureFrameLimit) {
-        m_captureEnabled = false;
-        captureShutdown();
-        return;
-    }
 
     const MinisfScreenCaptureApi *api = minisfScreenCaptureApi();
     if (!api->valid()) {
@@ -791,17 +679,8 @@ void HWC2Window::captureAfterPrimarySwap()
     const int64_t nowNs = captureMonotonicNs();
     if (nowNs >= m_captureNextSessionCheckNs) {
         MinisfScreenCaptureSessionInfo info = {};
-        const int64_t queryStartNs = captureMonotonicNs();
         const bool active = api->sessionQuery(&info) != 0;
-        const int64_t queryDurationNs = captureMonotonicNs() - queryStartNs;
         m_captureNextSessionCheckNs = nowNs + 250000000LL;
-
-        if (captureDebugEnabled()) {
-            qDebug("screencap: session query active=%d generation=%" PRIu64
-                   " %dx%d@%d took %.3fms", active, info.generation,
-                   info.width, info.height, info.fps,
-                   queryDurationNs / 1000000.0);
-        }
 
         if (!active) {
             if (m_captureTarget != nullptr) {
@@ -840,8 +719,6 @@ void HWC2Window::captureAfterPrimarySwap()
             m_captureRotation = rotation;
             m_captureOutputWidth = info.width;
             m_captureOutputHeight = info.height;
-            m_captureFramesSubmitted = 0;
-            m_captureFrameCounter = 0;
             m_captureNextFrameNs = 0;
         }
 
@@ -850,8 +727,7 @@ void HWC2Window::captureAfterPrimarySwap()
             captureShutdown();
         }
 
-        m_captureFps = m_captureFpsOverride
-            ? m_captureFpsOverride : qBound(1, info.fps, 120);
+        m_captureFps = qBound(1, info.fps, 120);
 
         if (m_captureFailedGeneration == info.generation) return;
         if (m_captureTarget == nullptr) {
@@ -870,12 +746,6 @@ void HWC2Window::captureAfterPrimarySwap()
         m_captureNextFrameNs += framePeriodNs;
     } while (m_captureNextFrameNs <= frameNowNs);
 
-    if (++m_captureFrameCounter % m_captureFrameSkip != 0) return;
-    if (captureDebugEnabled()) {
-        qDebug("screencap: primary swap returned; capture starts at %" PRId64
-               " frame=%d generation=%" PRIu64,
-               frameNowNs, m_captureFramesSubmitted + 1, m_captureGeneration);
-    }
     captureFrame(candidate, candidateFence.fd, candidateFenceValid,
                  m_captureOutputWidth, m_captureOutputHeight);
 }
@@ -965,10 +835,6 @@ static EGLImageKHR ensureEglImage(EGLDisplay dpy, buffer_handle_t key,
     cache[key] = img;
     texCache[key] = tex;
     outTex = tex;
-    if (captureDebugEnabled()) {
-        qDebug("screencap: imported HWC source native buffer=%p texture=%u",
-               static_cast<void *>(nativeBuffer), tex);
-    }
     return img;
 }
 
@@ -1076,28 +942,14 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src,
         return;
     }
 
-    if (m_captureSource) {
-        if (!sourceFenceValid) {
-            qWarning("screencap: source acquire-fence duplication failed in present");
-            captureFail("source acquire-fence duplication failed");
-            return;
-        }
-        if (sourceFenceFd >= 0) {
-            const int64_t waitStartNs = captureMonotonicNs();
-            const int waitResult = sync_wait(sourceFenceFd, 250);
-            const int waitError = waitResult == 0 ? 0 : errno;
-            const int64_t waitDurationNs = captureMonotonicNs() - waitStartNs;
-            if (captureDebugEnabled()) {
-                qDebug("screencap: source acquire-fence wait took %.3fms result=%d",
-                       waitDurationNs / 1000000.0, waitResult);
-            }
-            if (waitResult != 0) {
-                qWarning("screencap: source acquire-fence wait failed after %.3fms (errno=%d)",
-                         waitDurationNs / 1000000.0, waitError);
-                captureFail("source acquire-fence wait failed");
-                return;
-            }
-        }
+    if (!sourceFenceValid) {
+        captureFail("source acquire-fence duplication failed");
+        return;
+    }
+    if (sourceFenceFd >= 0 && sync_wait(sourceFenceFd, 250) != 0) {
+        qWarning("screencap: source acquire-fence wait failed (errno=%d)", errno);
+        captureFail("source acquire-fence wait failed");
+        return;
     }
 
     EglPresentationTimeANDROID presentationTime = eglPresentationTimeAndroidProc();
@@ -1122,11 +974,7 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src,
     }
 
     const char *renderFailure = nullptr;
-    if (m_captureTestBars) {
-        if (!renderTestBars(width, height, m_captureFramesSubmitted)) {
-            renderFailure = "test-bars shader/draw failed";
-        }
-    } else {
+    {
         const char *eglExtensions = eglQueryString(dpy, EGL_EXTENSIONS);
         const EGLint eglExtensionError = eglExtensions
             ? EGL_SUCCESS : eglGetError();
@@ -1171,8 +1019,7 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src,
         if (flushError != GL_NO_ERROR) {
             qWarning("screencap: capture render flush failed (gl=0x%x)",
                      flushError);
-            renderFailure = m_captureTestBars
-                ? "test-bars flush failed" : "source blit flush failed";
+            renderFailure = "source blit flush failed";
         }
     }
 
@@ -1244,77 +1091,9 @@ void HWC2Window::captureFrame(HWComposerNativeWindowBuffer *src,
         return;
     }
 
-    ++m_captureFramesSubmitted;
-    qDebug("screencap: submitted %s frame %d pts=%" PRId64
-           " swap=%.3fms", m_captureTestBars ? "test-bars" : "HWC-source",
-           m_captureFramesSubmitted, timestampNs,
-           swapDurationNs / 1000000.0);
-
-    if (swapDurationNs > 16666667LL) {
-        qWarning("screencap: encoder swap exceeded one 60-Hz display period: %.3fms",
-                 swapDurationNs / 1000000.0);
-    }
     if (swapDurationNs > 250000000LL) {
         captureFail("encoder swap exceeded 250ms hard latency limit");
-        return;
     }
-
-    if (m_captureFrameLimit > 0 &&
-        m_captureFramesSubmitted >= m_captureFrameLimit) {
-        qDebug("screencap: frame limit reached; disabling capture");
-        m_captureEnabled = false;
-        captureShutdown();
-    }
-}
-
-bool HWC2Window::renderTestBars(int dw, int dh, int frame)
-{
-    GlStateGuard guard;
-
-    static const char *vsSrc =
-        "attribute vec2 aPos;\n"
-        "varying vec2 vPos;\n"
-        "void main() { gl_Position = vec4(aPos, 0.0, 1.0);"
-        " vPos = aPos * 0.5 + 0.5; }";
-    static const char *fsSrc =
-        "precision mediump float;\n"
-        "varying vec2 vPos; uniform float uFrame;\n"
-        "void main() { float x = vPos.x;"
-        " if (x > 0.90 && vPos.y < 0.10) {"
-        " float bit = mod(uFrame, 2.0);"
-        " gl_FragColor = bit < 1.0 ? vec4(0.0,0.0,0.0,1.0) :"
-        " vec4(1.0,1.0,1.0,1.0); }"
-        " else if (x < 0.143) gl_FragColor = vec4(1.0,1.0,1.0,1.0);"
-        " else if (x < 0.286) gl_FragColor = vec4(1.0,1.0,0.0,1.0);"
-        " else if (x < 0.429) gl_FragColor = vec4(0.0,1.0,1.0,1.0);"
-        " else if (x < 0.572) gl_FragColor = vec4(0.0,1.0,0.0,1.0);"
-        " else if (x < 0.715) gl_FragColor = vec4(1.0,0.0,1.0,1.0);"
-        " else if (x < 0.858) gl_FragColor = vec4(1.0,0.0,0.0,1.0);"
-        " else gl_FragColor = vec4(0.0,0.0,1.0,1.0); }";
-
-    if (!m_captureBarsProgram) {
-        m_captureBarsProgram = createCaptureProgram(vsSrc, fsSrc, "test-bars");
-        if (!m_captureBarsProgram) return false;
-    }
-
-    clearCaptureGlErrors();
-    static const GLfloat verts[] = {
-        -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f
-    };
-    glUseProgram(m_captureBarsProgram);
-    glUniform1f(glGetUniformLocation(m_captureBarsProgram, "uFrame"),
-                static_cast<GLfloat>(frame));
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
-    glEnableVertexAttribArray(0);
-    glViewport(0, 0, dw, dh);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisableVertexAttribArray(0);
-    const GLenum error = glGetError();
-    if (error != GL_NO_ERROR) {
-        qWarning("screencap: test-bars draw failed (gl=0x%x)", error);
-        return false;
-    }
-    return true;
 }
 
 bool HWC2Window::blitRgbaToSurface(GLuint srcTex, int dw, int dh)
@@ -1324,14 +1103,13 @@ bool HWC2Window::blitRgbaToSurface(GLuint srcTex, int dw, int dh)
     static const char *vsSrc =
         "attribute vec2 aPos;\n"
         "varying vec2 vTex;\n"
-        "uniform float uFlipY;\n"
         "uniform float uRotation;\n"  /* 0 = none, 1 = 90 CW, 2 = 270 CW */
         "void main() {\n"
         "  gl_Position = vec4(aPos, 0.0, 1.0);\n"
         "  vec2 tex = aPos * 0.5 + 0.5;\n"
         "  if (uRotation > 1.5) tex = vec2(tex.y, 1.0 - tex.x);\n"
         "  else if (uRotation > 0.5) tex = vec2(1.0 - tex.y, tex.x);\n"
-        "  vTex = vec2(tex.x, mix(tex.y, 1.0 - tex.y, uFlipY));\n"
+        "  vTex = vec2(tex.x, 1.0 - tex.y);\n"
         "}";
     static const char *fsSrc =
         "precision mediump float;\n"
@@ -1356,15 +1134,13 @@ bool HWC2Window::blitRgbaToSurface(GLuint srcTex, int dw, int dh)
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, srcTex);
     const GLint textureUniform = glGetUniformLocation(program, "uTex");
-    const GLint flipUniform = glGetUniformLocation(program, "uFlipY");
     const GLint rotationUniform = glGetUniformLocation(program, "uRotation");
-    if (textureUniform < 0 || flipUniform < 0 || rotationUniform < 0) {
-        qWarning("screencap: source-blit uniforms unavailable (texture=%d flip=%d "
-                 "rotation=%d)", textureUniform, flipUniform, rotationUniform);
+    if (textureUniform < 0 || rotationUniform < 0) {
+        qWarning("screencap: source-blit uniforms unavailable (texture=%d "
+                 "rotation=%d)", textureUniform, rotationUniform);
         return false;
     }
     glUniform1i(textureUniform, 0);
-    glUniform1f(flipUniform, m_captureFlipY ? 1.0f : 0.0f);
     glUniform1f(rotationUniform,
                 m_captureRotation == 270 ? 2.0f :
                 m_captureRotation == 90 ? 1.0f : 0.0f);
