@@ -18,7 +18,6 @@ HEADERS += hwcomposer_screeninfo.h
 
 SOURCES += hwcomposer_backend.cpp
 HEADERS += hwcomposer_backend.h
-HEADERS += minisf_screen_capture.h
 
 SOURCES += hwcomposer_backend_v0.cpp
 HEADERS += hwcomposer_backend_v0.h
@@ -77,8 +76,8 @@ packagesExist(hwcomposer-egl) {
 qtCompileTest(hwcomposer2) {
     PKGCONFIG += libhwc2
     DEFINES += HWC_PLUGIN_HAVE_HWCOMPOSER2_API
-    SOURCES += hwcomposer_backend_v20.cpp
-    HEADERS += hwcomposer_backend_v20.h
+    SOURCES += hwcomposer_backend_v20.cpp hwcomposer_screencapture.cpp
+    HEADERS += hwcomposer_backend_v20.h hwcomposer_screencapture.h
 }
 
 # Avoid X11 header collision
