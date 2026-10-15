@@ -323,14 +323,9 @@ void HwComposerScreenCapture::captureFrame()
     if (!m_target)
         return;
 
-    const int64_t now = monotonicNs();
-    if (m_nextFrameNs == 0)
-        m_nextFrameNs = now;
-    if (now < m_nextFrameNs)
-        return;
-    while (m_nextFrameNs <= now)
-        m_nextFrameNs += 1000000000 / m_fps;
-
+    // Every frame is sent, whatever the session's fps. The compositor only
+    // renders when the screen changes, so a frame dropped to cap the rate
+    // may be the last one before the screen goes still.
     if (fence.fd >= 0 && sync_wait(fence.fd, FenceTimeoutMs) != 0) {
         qWarning("screencap: the display buffer was not ready in %d ms", FenceTimeoutMs);
         fail();
@@ -441,11 +436,9 @@ void HwComposerScreenCapture::attach(const MinisfScreenCaptureSessionInfo &info,
 
     m_width = info.width;
     m_height = info.height;
-    m_fps = qBound(1, info.fps, 120);
     m_rotation = rotation;
-    m_nextFrameNs = 0;
     qDebug("screencap: attached to session %" PRIu64 ": %dx%d@%d, rotation %d",
-           m_generation, m_width, m_height, m_fps, m_rotation);
+           m_generation, m_width, m_height, info.fps, m_rotation);
 }
 
 void HwComposerScreenCapture::detach()

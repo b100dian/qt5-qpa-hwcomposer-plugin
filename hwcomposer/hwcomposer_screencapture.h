@@ -115,9 +115,7 @@ private:
     uint64_t m_generation = 0;
     int m_width = 0;
     int m_height = 0;
-    int m_fps = 0;
     int m_rotation = 0;
-    int64_t m_nextFrameNs = 0;
 
     EGLDisplay m_display = EGL_NO_DISPLAY;
     EGLContext m_context = EGL_NO_CONTEXT;
