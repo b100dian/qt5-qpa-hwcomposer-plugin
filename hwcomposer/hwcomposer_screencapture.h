@@ -58,7 +58,7 @@ struct MinisfScreenCaptureSessionInfo;
  *
  * A recorder (droidmedia's droid_media_screen_capture_*) registers its
  * encoder's input Surface with the sailfish.screencap service. This class
- * polls the service through libminisf, and after every primary swap draws
+ * follows the service through libminisf, and after every primary swap draws
  * the buffer that was just presented into that Surface: one textured quad,
  * with no CPU copy. The recorder must ask for the display size, or its
  * transpose for a landscape recording.
@@ -79,7 +79,7 @@ private:
     HwComposerScreenCapture(int displayWidth, int displayHeight, int landscapeRotation);
 
     bool resolve(void *libminisf);
-    void pollSession();
+    void checkSession();
     void attach(const MinisfScreenCaptureSessionInfo &info, int rotation);
     void detach();
     void fail();
@@ -107,7 +107,6 @@ private:
     HWComposerNativeWindowBuffer *m_buffer = nullptr;
     int m_fenceFd = -1;
 
-    int64_t m_nextPollNs = 0;
     uint64_t m_failedGeneration = 0;
 
     // The session this object is attached to.

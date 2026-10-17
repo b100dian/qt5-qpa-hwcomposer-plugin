@@ -68,8 +68,6 @@ struct MinisfScreenCaptureSessionInfo {
     int fps;
 };
 
-// A session query is a Binder call on the render thread, so rate-limit it.
-static const int64_t SessionPollNs = 250000000;
 // A session that keeps the compositor waiting longer than this is given up.
 static const int FenceTimeoutMs = 250;
 static const int64_t MaxSwapNs = 250000000;
@@ -319,7 +317,7 @@ void HwComposerScreenCapture::captureFrame()
     if (!buffer)
         return;
 
-    pollSession();
+    checkSession();
     if (!m_target)
         return;
 
@@ -336,13 +334,9 @@ void HwComposerScreenCapture::captureFrame()
         fail();
 }
 
-void HwComposerScreenCapture::pollSession()
+void HwComposerScreenCapture::checkSession()
 {
-    const int64_t now = monotonicNs();
-    if (now < m_nextPollNs)
-        return;
-    m_nextPollNs = now + SessionPollNs;
-
+    // No Binder call: libminisf keeps the session the service pushes to it.
     MinisfScreenCaptureSessionInfo info;
     if (!m_sessionQuery(&info)) {
         if (m_target) {
@@ -377,7 +371,7 @@ void HwComposerScreenCapture::pollSession()
 
 void HwComposerScreenCapture::attach(const MinisfScreenCaptureSessionInfo &info, int rotation)
 {
-    // Null if another recorder took over since the query; the next poll sees it.
+    // Null if another recorder took over since the query; the next frame sees it.
     m_target = m_targetAcquireGeneration(info.generation);
     if (!m_target)
         return;
