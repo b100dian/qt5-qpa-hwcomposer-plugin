@@ -94,10 +94,10 @@ private:
     void (*m_targetRelease)(void *target) = nullptr;
 
     // EGL and GL extensions
-    PFNEGLCREATEIMAGEKHRPROC m_createImage = nullptr;
-    PFNEGLDESTROYIMAGEKHRPROC m_destroyImage = nullptr;
-    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC m_imageTargetTexture = nullptr;
-    PFNEGLPRESENTATIONTIMEANDROIDPROC m_presentationTime = nullptr;
+    PFNEGLCREATEIMAGEKHRPROC m_eglCreateImageKHR = nullptr;
+    PFNEGLDESTROYIMAGEKHRPROC m_eglDestroyImageKHR = nullptr;
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC m_glEGLImageTargetTexture2DOES = nullptr;
+    PFNEGLPRESENTATIONTIMEANDROIDPROC m_eglPresentationTimeANDROID = nullptr;
 
     const int m_displayWidth;
     const int m_displayHeight;
@@ -116,9 +116,9 @@ private:
     int m_height = 0;
     int m_rotation = 0;
 
-    EGLDisplay m_display = EGL_NO_DISPLAY;
+    EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
     EGLContext m_context = EGL_NO_CONTEXT;
-    EGLSurface m_surface = EGL_NO_SURFACE;
+    EGLSurface m_encoderSurface = EGL_NO_SURFACE;
     GLuint m_program = 0;
 
     struct Source {

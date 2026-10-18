@@ -72,10 +72,11 @@ struct MinisfScreenCaptureSessionInfo {
 static const int FenceTimeoutMs = 250;
 static const int64_t MaxSwapNs = 250000000;
 
+// Clip space, -1..+1 is the whole viewport
 static const GLfloat Positions[8] = { -1, -1,  1, -1,  -1, 1,  1, 1 };
-// Texture coordinates of the same corners for rotation 0, 90 and 270.
-// EGLImage rows are top-down while GL's t axis points up, so all of them
-// also flip y.
+
+// Texture space (0..1) coordinates of the same corners for rotation 0, 90 and 270.
+// They all flip-y.
 static const GLfloat TexCoords[3][8] = {
     { 0, 1,  1, 1,  0, 0,  1, 0 },
     { 1, 1,  1, 0,  0, 1,  0, 0 },
@@ -123,21 +124,21 @@ static GLuint compileShader(GLenum type, const char *source)
 
 static GLuint createProgram()
 {
-    static const char *vertexSource =
-        "attribute vec2 aPosition;\n"
-        "attribute vec2 aTexCoord;\n"
-        "varying vec2 vTexCoord;\n"
-        "void main() {\n"
-        "    gl_Position = vec4(aPosition, 0.0, 1.0);\n"
-        "    vTexCoord = aTexCoord;\n"
-        "}\n";
-    static const char *fragmentSource =
-        "precision mediump float;\n"
-        "uniform sampler2D uTexture;\n"
-        "varying vec2 vTexCoord;\n"
-        "void main() {\n"
-        "    gl_FragColor = texture2D(uTexture, vTexCoord);\n"
-        "}\n";
+    static const char *vertexSource = R"(
+        attribute vec2 aPosition;
+        attribute vec2 aTexCoord;
+        varying vec2 vTexCoord;
+        void main() {
+            gl_Position = vec4(aPosition, 0.0, 1.0);
+            vTexCoord = aTexCoord;
+        })";
+    static const char *fragmentSource = R"(
+        precision mediump float;
+        uniform sampler2D uTexture;
+        varying vec2 vTexCoord;
+        void main() {
+            gl_FragColor = texture2D(uTexture, vTexCoord);
+        })";
 
     const GLuint vertex = compileShader(GL_VERTEX_SHADER, vertexSource);
     const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, fragmentSource);
@@ -171,32 +172,27 @@ class ScopedCaptureContext
 {
 public:
     ScopedCaptureContext(EGLDisplay display, EGLSurface surface, EGLContext context)
-        : m_captureDisplay(display)
-        , m_display(eglGetCurrentDisplay())
-        , m_draw(eglGetCurrentSurface(EGL_DRAW))
-        , m_read(eglGetCurrentSurface(EGL_READ))
-        , m_context(eglGetCurrentContext())
+        : m_eglDisplay(display)
+        , m_savedDraw(eglGetCurrentSurface(EGL_DRAW))
+        , m_savedRead(eglGetCurrentSurface(EGL_READ))
+        , m_savedContext(eglGetCurrentContext())
         , m_current(eglMakeCurrent(display, surface, surface, context))
     {
     }
 
     ~ScopedCaptureContext()
     {
-        const EGLBoolean restored = m_display != EGL_NO_DISPLAY
-            ? eglMakeCurrent(m_display, m_draw, m_read, m_context)
-            : eglMakeCurrent(m_captureDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (!restored)
+        if (!eglMakeCurrent(m_eglDisplay, m_savedDraw, m_savedRead, m_savedContext))
             qWarning("screencap: cannot restore the compositor's EGL context (0x%x)", eglGetError());
     }
 
     bool isCurrent() const { return m_current; }
 
 private:
-    EGLDisplay m_captureDisplay;
-    EGLDisplay m_display;
-    EGLSurface m_draw;
-    EGLSurface m_read;
-    EGLContext m_context;
+    EGLDisplay m_eglDisplay;
+    EGLSurface m_savedDraw;
+    EGLSurface m_savedRead;
+    EGLContext m_savedContext;
     bool m_current;
 };
 
@@ -272,15 +268,15 @@ bool HwComposerScreenCapture::resolve(void *libminisf)
 
     // Through eglGetProcAddress, so that libhybris can map its buffers for
     // the EGLImage calls.
-    m_createImage = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(
+    m_eglCreateImageKHR = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(
         eglGetProcAddress("eglCreateImageKHR"));
-    m_destroyImage = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(
+    m_eglDestroyImageKHR = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(
         eglGetProcAddress("eglDestroyImageKHR"));
-    m_imageTargetTexture = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+    m_glEGLImageTargetTexture2DOES = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
         eglGetProcAddress("glEGLImageTargetTexture2DOES"));
-    m_presentationTime = reinterpret_cast<PFNEGLPRESENTATIONTIMEANDROIDPROC>(
+    m_eglPresentationTimeANDROID = reinterpret_cast<PFNEGLPRESENTATIONTIMEANDROIDPROC>(
         eglGetProcAddress("eglPresentationTimeANDROID"));
-    if (!m_createImage || !m_destroyImage || !m_imageTargetTexture || !m_presentationTime) {
+    if (!m_eglCreateImageKHR || !m_eglDestroyImageKHR || !m_glEGLImageTargetTexture2DOES || !m_eglPresentationTimeANDROID) {
         qWarning("screencap: EGLImage or presentation time extensions are missing, "
                  "capture disabled");
         return false;
@@ -376,7 +372,7 @@ void HwComposerScreenCapture::attach(const MinisfScreenCaptureSessionInfo &info,
     if (!m_target)
         return;
     m_generation = info.generation;
-    m_display = eglGetCurrentDisplay();
+    m_eglDisplay = eglGetCurrentDisplay();
 
     static const EGLint configAttribs[] = {
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -392,23 +388,23 @@ void HwComposerScreenCapture::attach(const MinisfScreenCaptureSessionInfo &info,
 
     EGLConfig config;
     EGLint configs = 0;
-    if (!eglChooseConfig(m_display, configAttribs, &config, 1, &configs) || configs == 0) {
+    if (!eglChooseConfig(m_eglDisplay, configAttribs, &config, 1, &configs) || configs == 0) {
         qWarning("screencap: no recordable EGL config (0x%x)", eglGetError());
         fail();
         return;
     }
 
     // A private context, so that no GL state is shared with the compositor.
-    m_context = eglCreateContext(m_display, config, EGL_NO_CONTEXT, contextAttribs);
+    m_context = eglCreateContext(m_eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
     if (m_context == EGL_NO_CONTEXT) {
         qWarning("screencap: eglCreateContext failed (0x%x)", eglGetError());
         fail();
         return;
     }
 
-    m_surface = eglCreateWindowSurface(m_display, config,
+    m_encoderSurface = eglCreateWindowSurface(m_eglDisplay, config,
         reinterpret_cast<EGLNativeWindowType>(m_targetNativeWindow(m_target)), nullptr);
-    if (m_surface == EGL_NO_SURFACE) {
+    if (m_encoderSurface == EGL_NO_SURFACE) {
         qWarning("screencap: eglCreateWindowSurface failed (0x%x)", eglGetError());
         fail();
         return;
@@ -418,8 +414,8 @@ void HwComposerScreenCapture::attach(const MinisfScreenCaptureSessionInfo &info,
     // waits for the encoder to release a buffer.
     bool ready;
     {
-        ScopedCaptureContext scope(m_display, m_surface, m_context);
-        ready = scope.isCurrent() && eglSwapInterval(m_display, 0);
+        ScopedCaptureContext scope(m_eglDisplay, m_encoderSurface, m_context);
+        ready = scope.isCurrent() && eglSwapInterval(m_eglDisplay, 0);
         if (!ready)
             qWarning("screencap: cannot set up the encoder Surface (0x%x)", eglGetError());
     }
@@ -439,19 +435,19 @@ void HwComposerScreenCapture::detach()
 {
     // Destroying the private context also deletes its program and textures.
     if (m_context != EGL_NO_CONTEXT)
-        eglDestroyContext(m_display, m_context);
+        eglDestroyContext(m_eglDisplay, m_context);
     for (auto &source : m_sources)
-        m_destroyImage(m_display, source.second.image);
-    if (m_surface != EGL_NO_SURFACE)
-        eglDestroySurface(m_display, m_surface);
+        m_eglDestroyImageKHR(m_eglDisplay, source.second.image);
+    if (m_encoderSurface != EGL_NO_SURFACE)
+        eglDestroySurface(m_eglDisplay, m_encoderSurface);
     if (m_target)
         m_targetRelease(m_target);
 
     m_sources.clear();
     m_program = 0;
     m_context = EGL_NO_CONTEXT;
-    m_surface = EGL_NO_SURFACE;
-    m_display = EGL_NO_DISPLAY;
+    m_encoderSurface = EGL_NO_SURFACE;
+    m_eglDisplay = EGL_NO_DISPLAY;
     m_target = nullptr;
     m_generation = 0;
 }
@@ -465,7 +461,7 @@ void HwComposerScreenCapture::fail()
 
 bool HwComposerScreenCapture::submit(HWComposerNativeWindowBuffer *buffer)
 {
-    ScopedCaptureContext scope(m_display, m_surface, m_context);
+    ScopedCaptureContext scope(m_eglDisplay, m_encoderSurface, m_context);
     if (!scope.isCurrent()) {
         qWarning("screencap: cannot make the encoder Surface current (0x%x)", eglGetError());
         return false;
@@ -476,13 +472,13 @@ bool HwComposerScreenCapture::submit(HWComposerNativeWindowBuffer *buffer)
 
     // The recorder's timestamps, including its end of recording, use
     // CLOCK_MONOTONIC as well.
-    if (!m_presentationTime(m_display, m_surface, monotonicNs())) {
+    if (!m_eglPresentationTimeANDROID(m_eglDisplay, m_encoderSurface, monotonicNs())) {
         qWarning("screencap: eglPresentationTimeANDROID failed (0x%x)", eglGetError());
         return false;
     }
 
     const int64_t start = monotonicNs();
-    if (!eglSwapBuffers(m_display, m_surface)) {
+    if (!eglSwapBuffers(m_eglDisplay, m_encoderSurface)) {
         qWarning("screencap: eglSwapBuffers failed (0x%x)", eglGetError());
         return false;
     }
@@ -529,7 +525,7 @@ GLuint HwComposerScreenCapture::sourceTexture(HWComposerNativeWindowBuffer *buff
         return it->second.texture;
 
     static const EGLint imageAttribs[] = { EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE };
-    const EGLImageKHR image = m_createImage(m_display, EGL_NO_CONTEXT,
+    const EGLImageKHR image = m_eglCreateImageKHR(m_eglDisplay, EGL_NO_CONTEXT,
         EGL_NATIVE_BUFFER_ANDROID,
         reinterpret_cast<EGLClientBuffer>(buffer->getNativeBuffer()), imageAttribs);
     if (image == EGL_NO_IMAGE_KHR) {
@@ -540,7 +536,7 @@ GLuint HwComposerScreenCapture::sourceTexture(HWComposerNativeWindowBuffer *buff
     GLuint texture = 0;
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
-    m_imageTargetTexture(GL_TEXTURE_2D, reinterpret_cast<GLeglImageOES>(image));
+    m_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, reinterpret_cast<GLeglImageOES>(image));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -550,7 +546,7 @@ GLuint HwComposerScreenCapture::sourceTexture(HWComposerNativeWindowBuffer *buff
     if (error != GL_NO_ERROR) {
         qWarning("screencap: cannot bind a display buffer to a texture (0x%x)", error);
         glDeleteTextures(1, &texture);
-        m_destroyImage(m_display, image);
+        m_eglDestroyImageKHR(m_eglDisplay, image);
         return 0;
     }
 
