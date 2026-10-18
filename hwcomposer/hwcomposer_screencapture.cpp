@@ -59,8 +59,8 @@ extern "C" void *android_dlsym(void *handle, const char *symbol);
 #define EGL_RECORDABLE_ANDROID 0x3142
 #endif
 
-// The session layout of libminisf (droidmedia, minisf_screen_capture.cpp).
-// Keep the two in sync.
+// The session layout of libminisf (droidmedia, ScreenCaptureSession in
+// screen_capture_service.h). Keep the two in sync.
 struct MinisfScreenCaptureSessionInfo {
     uint64_t generation;
     int width;
