@@ -62,6 +62,10 @@ struct MinisfScreenCaptureSessionInfo;
  * the buffer that was just presented into that Surface: one textured quad,
  * with no CPU copy. The recorder must ask for the display size, or its
  * transpose for a landscape recording.
+ *
+ * Every rendered frame is sent; the session's fps is only the encoder's
+ * nominal rate. The compositor renders only when the screen changes, so the
+ * last frame before a still screen must not be dropped.
  */
 class HwComposerScreenCapture
 {

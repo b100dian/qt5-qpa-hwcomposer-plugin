@@ -317,9 +317,6 @@ void HwComposerScreenCapture::captureFrame()
     if (!m_target)
         return;
 
-    // Every frame is sent, whatever the session's fps. The compositor only
-    // renders when the screen changes, so a frame dropped to cap the rate
-    // may be the last one before the screen goes still.
     if (fence.fd >= 0 && sync_wait(fence.fd, FenceTimeoutMs) != 0) {
         qWarning("screencap: the display buffer was not ready in %d ms", FenceTimeoutMs);
         fail();
@@ -332,7 +329,7 @@ void HwComposerScreenCapture::captureFrame()
 
 void HwComposerScreenCapture::checkSession()
 {
-    // No Binder call: libminisf keeps the session the service pushes to it.
+    // Reads libminisf's copy of the session, which the service keeps up to date.
     MinisfScreenCaptureSessionInfo info;
     if (!m_sessionQuery(&info)) {
         if (m_target) {
