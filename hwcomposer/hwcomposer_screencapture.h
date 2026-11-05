@@ -48,29 +48,54 @@
 #include <cutils/native_handle.h>
 #include <stdint.h>
 
+#include <QtCore/QObject>
+#include <QtCore/QRect>
+#include <QtCore/QSize>
+
 #include <map>
 
 class HWComposerNativeWindowBuffer;
 struct MinisfScreenCaptureSessionInfo;
 
+// Where HwComposerScreenCapture draws the display in a session's frame.
+struct CaptureFit {
+    int rotation;    // 0, 90 or 270
+    QRect viewport;  // top-left origin
+};
+
+// Turns the display by landscapeRotation if its orientation differs from the content rect's
+// (an empty one is the whole frame), then fits it in, centred, sizes rounded down to even.
+inline CaptureFit captureFit(const QSize &display, const QSize &session,
+                             const QRect &content, int landscapeRotation)
+{
+    const QRect rect = content.isEmpty() ? QRect(QPoint(), session) : content;
+    const bool rotate = (rect.width() > rect.height() && display.width() < display.height()) ||
+                        (rect.width() < rect.height() && display.width() > display.height());
+    const QSize source = rotate ? display.transposed() : display;
+
+    QSize fitted = source.scaled(rect.size(), Qt::KeepAspectRatio);
+    fitted.rwidth() &= ~1;
+    fitted.rheight() &= ~1;
+
+    return {
+        rotate ? landscapeRotation : 0,
+        QRect(rect.x() + (rect.width() - fitted.width()) / 2,
+              rect.y() + (rect.height() - fitted.height()) / 2,
+              fitted.width(), fitted.height())
+    };
+}
+
 /*
- * Renders the display into the encoder Surface of a screen recorder.
- *
- * A recorder (droidmedia's droid_media_screen_capture_*) registers its
- * encoder's input Surface with the sailfish.screencap service. This class
- * follows the service through libminisf, and after every primary swap draws
- * the buffer that was just presented into that Surface: one textured quad,
- * with no CPU copy. The recorder must ask for the display size, or its
- * transpose for a landscape recording.
- *
- * Every rendered frame is sent; the session's fps is only the encoder's
- * nominal rate. The compositor renders only when the screen changes, so the
- * last frame before a still screen must not be dropped.
+ * Renders the display into the encoder Surface of a screen recorder (droidmedia's
+ * droid_media_screen_capture_*), following its sailfish.screencap session through libminisf.
+ * After every primary swap, the buffer just presented is drawn as one quad fitted by
+ * captureFit(), with no CPU copy; every rendered frame is sent. Only DISPLAY sessions are
+ * rendered. Session changes and frame requests repaint the exposed windows (event()).
  */
-class HwComposerScreenCapture
+class HwComposerScreenCapture : public QObject
 {
 public:
-    // Returns nullptr unless QPA_HWC_SCREENCAP is 1 or true.
+    // Returns nullptr unless QPA_HWC_SCREENCAP is 1 or true. On the GUI thread.
     static HwComposerScreenCapture *create(int displayWidth, int displayHeight);
     ~HwComposerScreenCapture();
 
@@ -79,12 +104,15 @@ public:
     // After the primary eglSwapBuffers() has returned.
     void captureFrame();
 
+    bool event(QEvent *e) override;
+
 private:
     HwComposerScreenCapture(int displayWidth, int displayHeight, int landscapeRotation);
 
     bool resolve(void *libminisf);
+    static void sessionCallback(void *user, int event);
     void checkSession();
-    void attach(const MinisfScreenCaptureSessionInfo &info, int rotation);
+    void attach(const MinisfScreenCaptureSessionInfo &info, const CaptureFit &fit);
     void detach();
     void fail();
     bool submit(HWComposerNativeWindowBuffer *buffer);
@@ -96,6 +124,7 @@ private:
     void *(*m_targetAcquireGeneration)(uint64_t generation) = nullptr;
     void *(*m_targetNativeWindow)(void *target) = nullptr;
     void (*m_targetRelease)(void *target) = nullptr;
+    void (*m_setCallback)(void (*callback)(void *user, int event), void *user) = nullptr;
 
     // EGL and GL extensions
     PFNEGLCREATEIMAGEKHRPROC m_eglCreateImageKHR = nullptr;
@@ -111,14 +140,15 @@ private:
     HWComposerNativeWindowBuffer *m_buffer = nullptr;
     int m_fenceFd = -1;
 
-    uint64_t m_failedGeneration = 0;
+    // The session this object gave up on, or does not render.
+    uint64_t m_ignoredGeneration = 0;
 
     // The session this object is attached to.
     void *m_target = nullptr;
     uint64_t m_generation = 0;
     int m_width = 0;
     int m_height = 0;
-    int m_rotation = 0;
+    CaptureFit m_fit = {};
 
     EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
     EGLContext m_context = EGL_NO_CONTEXT;

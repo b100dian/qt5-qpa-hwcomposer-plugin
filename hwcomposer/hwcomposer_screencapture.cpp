@@ -44,6 +44,11 @@
 #include <sync/sync.h>
 
 #include <QtCore/QByteArray>
+#include <QtCore/QCoreApplication>
+#include <QtCore/QEvent>
+#include <QtCore/QMetaObject>
+#include <QtGui/QGuiApplication>
+#include <QtGui/QWindow>
 #include <qdebug.h>
 
 #include <dlfcn.h>
@@ -59,14 +64,23 @@ extern "C" void *android_dlsym(void *handle, const char *symbol);
 #define EGL_RECORDABLE_ANDROID 0x3142
 #endif
 
-// The session layout of libminisf (droidmedia, ScreenCaptureSession in
-// screen_capture_service.h). Keep the two in sync.
+// Matches sailfish::ScreenCaptureSession in droidmedia/screen_capture_service.h.
 struct MinisfScreenCaptureSessionInfo {
     uint64_t generation;
-    int width;
-    int height;
-    int fps;
+    int32_t width;
+    int32_t height;
+    int32_t fps;
+    int32_t target;
+    int32_t contentLeft;
+    int32_t contentTop;
+    int32_t contentRight;
+    int32_t contentBottom;
 };
+
+enum { TargetDisplay = 0 };
+enum { SessionChanged = 1, FrameRequested = 2 };
+
+static const int MaxSessionSize = 4096;
 
 // A session that keeps the compositor waiting longer than this is given up.
 static const int FenceTimeoutMs = 250;
@@ -90,18 +104,9 @@ static int64_t monotonicNs()
     return int64_t(ts.tv_sec) * 1000000000 + ts.tv_nsec;
 }
 
-// The rotation that turns the display into the session size: 0 for the
-// display size, the landscape rotation for its transpose, -1 for anything else.
-static int captureSessionRotation(int displayWidth, int displayHeight,
-                                  int sessionWidth, int sessionHeight,
-                                  int landscapeRotation)
+static bool validSessionSize(int size)
 {
-    if (sessionWidth == displayWidth && sessionHeight == displayHeight)
-        return 0;
-    if (displayWidth != displayHeight &&
-        sessionWidth == displayHeight && sessionHeight == displayWidth)
-        return landscapeRotation;
-    return -1;
+    return size > 0 && size <= MaxSessionSize && size % 2 == 0;
 }
 
 static GLuint compileShader(GLenum type, const char *source)
@@ -230,6 +235,8 @@ HwComposerScreenCapture *HwComposerScreenCapture::create(int displayWidth, int d
         return nullptr;
     }
 
+    capture->m_setCallback(sessionCallback, capture);
+
     qDebug("screencap: enabled for a %dx%d display, landscape rotation %d",
            displayWidth, displayHeight, landscapeRotation);
     return capture;
@@ -245,6 +252,10 @@ HwComposerScreenCapture::HwComposerScreenCapture(int displayWidth, int displayHe
 
 HwComposerScreenCapture::~HwComposerScreenCapture()
 {
+    // Waits for a running callback, which posts events to this object.
+    if (m_setCallback)
+        m_setCallback(nullptr, nullptr);
+
     detach();
     if (m_fenceFd >= 0)
         close(m_fenceFd);
@@ -260,8 +271,10 @@ bool HwComposerScreenCapture::resolve(void *libminisf)
         android_dlsym(libminisf, "minisf_screen_capture_target_native_window"));
     m_targetRelease = reinterpret_cast<decltype(m_targetRelease)>(
         android_dlsym(libminisf, "minisf_screen_capture_target_release"));
+    m_setCallback = reinterpret_cast<decltype(m_setCallback)>(
+        android_dlsym(libminisf, "minisf_screen_capture_set_callback"));
     if (!m_sessionQuery || !m_targetAcquireGeneration || !m_targetNativeWindow ||
-        !m_targetRelease) {
+        !m_targetRelease || !m_setCallback) {
         qWarning("screencap: libminisf has no screen capture API, capture disabled");
         return false;
     }
@@ -282,6 +295,42 @@ bool HwComposerScreenCapture::resolve(void *libminisf)
         return false;
     }
 
+    return true;
+}
+
+// On a Binder thread. The repaint's frame attaches to a new session, detaches from
+// an ended one, or is the frame a recorder asked for.
+void HwComposerScreenCapture::sessionCallback(void *user, int event)
+{
+    HwComposerScreenCapture *capture = static_cast<HwComposerScreenCapture *>(user);
+
+    if (event == FrameRequested) {
+        MinisfScreenCaptureSessionInfo info;
+        if (!capture->m_sessionQuery(&info) || info.target != TargetDisplay)
+            return;
+    } else if (event != SessionChanged) {
+        return;
+    }
+
+    QCoreApplication::postEvent(capture, new QEvent(QEvent::User));
+}
+
+bool HwComposerScreenCapture::event(QEvent *e)
+{
+    if (e->type() != QEvent::User)
+        return QObject::event(e);
+
+    const QWindowList windows = QGuiApplication::topLevelWindows();
+    for (QWindow *window : windows) {
+        if (!window->isExposed())
+            continue;
+        // QQuickWindow::update() renders and swaps even an unchanged scene;
+        // requestUpdate() does not with the threaded render loop.
+        if (window->metaObject()->indexOfSlot("update()") >= 0)
+            QMetaObject::invokeMethod(window, "update");
+        else
+            window->requestUpdate();
+    }
     return true;
 }
 
@@ -329,7 +378,6 @@ void HwComposerScreenCapture::captureFrame()
 
 void HwComposerScreenCapture::checkSession()
 {
-    // Reads libminisf's copy of the session, which the service keeps up to date.
     MinisfScreenCaptureSessionInfo info;
     if (!m_sessionQuery(&info)) {
         if (m_target) {
@@ -345,24 +393,32 @@ void HwComposerScreenCapture::checkSession()
         qDebug("screencap: session %" PRIu64 " replaced, detaching", m_generation);
         detach();
     }
-    if (info.generation == m_failedGeneration)
+    if (info.generation == m_ignoredGeneration)
         return;
 
-    const int rotation = captureSessionRotation(m_displayWidth, m_displayHeight,
-                                                info.width, info.height,
-                                                m_landscapeRotation);
-    if (rotation < 0 || info.fps <= 0) {
-        qWarning("screencap: rejecting session %" PRIu64 " of %dx%d@%d: the display is "
-                 "%dx%d (%dx%d in landscape)", info.generation, info.width, info.height,
-                 info.fps, m_displayWidth, m_displayHeight, m_displayHeight, m_displayWidth);
-        m_failedGeneration = info.generation;
+    if (info.target != TargetDisplay) {
+        qDebug("screencap: ignoring session %" PRIu64 ": target %d is not the display",
+               info.generation, info.target);
+        m_ignoredGeneration = info.generation;
         return;
     }
 
-    attach(info, rotation);
+    if (!validSessionSize(info.width) || !validSessionSize(info.height) || info.fps <= 0) {
+        qWarning("screencap: rejecting session %" PRIu64 " of %dx%d@%d: sizes must be even "
+                 "and at most %d", info.generation, info.width, info.height, info.fps,
+                 MaxSessionSize);
+        m_ignoredGeneration = info.generation;
+        return;
+    }
+
+    const QRect content(info.contentLeft, info.contentTop, info.contentRight - info.contentLeft,
+                        info.contentBottom - info.contentTop);
+    attach(info, captureFit(QSize(m_displayWidth, m_displayHeight), QSize(info.width, info.height),
+                            content, m_landscapeRotation));
 }
 
-void HwComposerScreenCapture::attach(const MinisfScreenCaptureSessionInfo &info, int rotation)
+void HwComposerScreenCapture::attach(const MinisfScreenCaptureSessionInfo &info,
+                                     const CaptureFit &fit)
 {
     // Null if another recorder took over since the query; the next frame sees it.
     m_target = m_targetAcquireGeneration(info.generation);
@@ -423,9 +479,11 @@ void HwComposerScreenCapture::attach(const MinisfScreenCaptureSessionInfo &info,
 
     m_width = info.width;
     m_height = info.height;
-    m_rotation = rotation;
-    qDebug("screencap: attached to session %" PRIu64 ": %dx%d@%d, rotation %d",
-           m_generation, m_width, m_height, info.fps, m_rotation);
+    m_fit = fit;
+    const QRect &vp = m_fit.viewport;
+    qDebug("screencap: attached to session %" PRIu64 ": %dx%d@%d, rotation %d, "
+           "viewport %d,%d %dx%d", m_generation, m_width, m_height, info.fps,
+           m_fit.rotation, vp.x(), vp.y(), vp.width(), vp.height());
 }
 
 void HwComposerScreenCapture::detach()
@@ -452,7 +510,7 @@ void HwComposerScreenCapture::detach()
 void HwComposerScreenCapture::fail()
 {
     qWarning("screencap: giving up on session %" PRIu64, m_generation);
-    m_failedGeneration = m_generation;
+    m_ignoredGeneration = m_generation;
     detach();
 }
 
@@ -497,8 +555,15 @@ bool HwComposerScreenCapture::render(HWComposerNativeWindowBuffer *buffer)
     if (!m_program && !(m_program = createProgram()))
         return false;
 
-    const int corners = m_rotation == 90 ? 1 : m_rotation == 270 ? 2 : 0;
-    glViewport(0, 0, m_width, m_height);
+    // EGL leaves the buffer undefined after a swap, so clear the bars around
+    // the picture. A full clear also spares the GPU loading the old contents.
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    const int corners = m_fit.rotation == 90 ? 1 : m_fit.rotation == 270 ? 2 : 0;
+    const QRect &vp = m_fit.viewport;
+    // glViewport() counts y from the bottom.
+    glViewport(vp.x(), m_height - vp.y() - vp.height(), vp.width(), vp.height());
     glUseProgram(m_program);
     glBindTexture(GL_TEXTURE_2D, texture);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, Positions);
